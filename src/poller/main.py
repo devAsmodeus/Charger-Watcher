@@ -1,0 +1,412 @@
+﻿from __future__ import annotations
+
+import asyncio
+import signal
+import time
+from collections.abc import Iterable
+
+import orjson
+import redis.asyncio as aioredis
+import structlog
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from api.client import (
+    FREE_OCPP_STATUSES,
+    SUPPORTED_OPERATORS_MVP,
+    ProviderClient,
+)
+from api.models import LocationStatus, LocationSummary, Operator
+from config import get_settings
+from db.models import Location, Subscription
+from db.session import SessionLocal
+from logging_setup import setup_logging
+
+log = structlog.get_logger(__name__)
+
+EVENTS_STREAM = "charger:events"
+
+
+# ---------- location catalog ----------
+
+async def upsert_locations(operator: Operator, items: list[LocationSummary]) -> dict[str, int]:
+    """Upsert rows, return mapping external_id -> internal location id."""
+    if not items:
+        return {}
+    rows = [
+        {
+            "operator": operator.value,
+            "external_id": item.id,
+            "name": item.name,
+            "address": item.address,
+            "latitude": item.latitude,
+            "longitude": item.longitude,
+            "last_status": item.status.value if item.status else None,
+        }
+        for item in items
+    ]
+    async with SessionLocal() as s:
+        stmt = pg_insert(Location).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["operator", "external_id"],
+            set_={
+                "name": stmt.excluded.name,
+                "address": stmt.excluded.address,
+                "latitude": stmt.excluded.latitude,
+                "longitude": stmt.excluded.longitude,
+                "last_status": stmt.excluded.last_status,
+                "last_seen_at": func.now(),
+            },
+        ).returning(Location.external_id, Location.id)
+        result = await s.execute(stmt)
+        mapping = {row.external_id: row.id for row in result}
+        await s.commit()
+    return mapping
+
+
+async def sync_central_catalog(client: ProviderClient) -> None:
+    """Fetch Network A location list and upsert into DB.
+
+    Status is not provided by this endpoint — we only cache coordinates/names
+    so users can /find and /subscribe to Network A points. Real status
+    for subscribed locations is driven by the SSE manager.
+    """
+    try:
+        items = await client.list_locations(Operator.MAIN)
+    except Exception as e:
+        log.warning("central_catalog_failed", err=str(e))
+        return
+    await upsert_locations(Operator.MAIN, items)
+    log.info("central_catalog_synced", count=len(items))
+
+
+# ---------- redis events ----------
+
+async def publish_event(redis: aioredis.Redis, payload: dict) -> None:
+    await redis.xadd(EVENTS_STREAM, {"data": orjson.dumps(payload).decode()}, maxlen=10_000)
+
+
+# ---------- REST diff loop (Evika / Battery-fly) ----------
+
+async def rest_diff_once(
+    client: ProviderClient,
+    redis: aioredis.Redis,
+    prev: dict[tuple[Operator, str], LocationStatus],
+) -> dict[tuple[Operator, str], LocationStatus]:
+    now = int(time.time())
+    new_state: dict[tuple[Operator, str], LocationStatus] = {}
+
+    for op in SUPPORTED_OPERATORS_MVP:
+        try:
+            items = await client.list_locations(op)
+        except Exception as e:
+            log.warning("list_locations_failed", operator=op.value, err=str(e))
+            continue
+
+        ext_to_id = await upsert_locations(op, items)
+
+        for item in items:
+            if item.status is None:
+                continue
+            key = (op, item.id)
+            new_state[key] = item.status
+
+            old = prev.get(key)
+            if old is None or old == item.status:
+                continue
+
+            location_id = ext_to_id.get(item.id)
+            if location_id is None:
+                continue
+            await publish_event(
+                redis,
+                {
+                    "ts": now,
+                    "operator": op.value,
+                    "location_id": location_id,
+                    "external_id": item.id,
+                    "from_status": old.value,
+                    "to_status": item.status.value,
+                    "became_available": item.status is LocationStatus.AVAILABLE,
+                    "name": item.name,
+                    "address": item.address,
+                    "lat": item.latitude,
+                    "lon": item.longitude,
+                },
+            )
+            log.info(
+                "status_change",
+                operator=op.value,
+                ext=item.id,
+                name=item.name,
+                from_=old.value,
+                to=item.status.value,
+            )
+
+    return new_state
+
+
+# ---------- SSE manager for Network A ----------
+
+async def _get_central_device_numbers(
+    client: ProviderClient, external_id: str
+) -> list[int]:
+    """One-off call to discover device.number list for a Network A location."""
+    try:
+        detail = await client.get_location_detail(Operator.MAIN, external_id)
+    except Exception as e:
+        log.warning("central_detail_failed", ext=external_id, err=str(e))
+        return []
+    out: list[int] = []
+    for d in detail.devices:
+        try:
+            out.append(int(d.number))  # type: ignore[arg-type]
+        except Exception:
+            continue
+    return out
+
+
+async def _sse_worker(
+    client: ProviderClient,
+    redis: aioredis.Redis,
+    device_number: int,
+    location_id: int,
+    external_id: str,
+    name: str,
+    address: str,
+    lat: float,
+    lon: float,
+) -> None:
+    """Long-lived task: consume SSE, detect 'any connector Available' transitions.
+
+    The remote emits a heartbeat every ~2s with the current state of every
+    connector on this device — we diff locally.
+    """
+    log.info("sse_open", device=device_number, ext=external_id)
+    # per-connector last seen OCPP status
+    last: dict[int, str] = {}
+    # derived: is *any* connector of this device currently Available
+    last_any_free: bool | None = None
+    backoff = 1.0  # exponential reconnect backoff (seconds), cap at 60
+
+    while True:
+        try:
+            async for frame in client.stream_device_status(device_number):
+                backoff = 1.0  # connection healthy — reset backoff
+                status = frame.get("status")
+                code = frame.get("codeByProtocol")
+                if not isinstance(status, str) or not isinstance(code, int):
+                    continue
+                last[code] = status
+                any_free = any(s in FREE_OCPP_STATUSES for s in last.values())
+
+                if last_any_free is None:
+                    last_any_free = any_free
+                    continue
+                if any_free == last_any_free:
+                    continue
+
+                last_any_free = any_free
+                if any_free:
+                    # location transitioned to having at least one free connector
+                    now = int(time.time())
+                    await publish_event(
+                        redis,
+                        {
+                            "ts": now,
+                            "operator": Operator.MAIN.value,
+                            "location_id": location_id,
+                            "external_id": external_id,
+                            "from_status": "FULLY_USED",
+                            "to_status": "AVAILABLE",
+                            "became_available": True,
+                            "name": name,
+                            "address": address,
+                            "lat": lat,
+                            "lon": lon,
+                            "device_number": device_number,
+                        },
+                    )
+                    log.info(
+                        "sse_available",
+                        device=device_number,
+                        ext=external_id,
+                        connector=code,
+                    )
+        except asyncio.CancelledError:
+            log.info("sse_cancelled", device=device_number)
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "sse_worker_error",
+                device=device_number,
+                err=str(e),
+                sleep=round(backoff, 1),
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+
+
+async def _subscribed_central_locations() -> list[Location]:
+    """Locations of Network A that are targeted by at least one live subscription."""
+    async with SessionLocal() as s:
+        rows = (
+            await s.execute(
+                select(Location)
+                .join(Subscription, Subscription.location_id == Location.id)
+                .where(Location.operator == Operator.MAIN.value)
+                .distinct()
+            )
+        ).scalars().all()
+    return list(rows)
+
+
+class SseManager:
+    """Reconciles live SSE workers against subscribed Network A locations.
+
+    Every `sse_sync_interval_sec` it:
+      - loads the set of subscribed locations (from DB)
+      - ensures each location's devices have a running SSE worker
+      - cancels workers for devices no longer referenced by any subscription
+    """
+
+    def __init__(self, client: ProviderClient, redis: aioredis.Redis) -> None:
+        self._client = client
+        self._redis = redis
+        # device_number -> (task, location_id)
+        self._workers: dict[int, asyncio.Task[None]] = {}
+        # location_id -> list[device_number]  (cache so we don't re-query detail)
+        self._loc_devices: dict[int, list[int]] = {}
+
+    async def tick(self) -> None:
+        locs = await _subscribed_central_locations()
+        wanted: dict[int, Location] = {}  # device_number -> Location row
+
+        for loc in locs:
+            if loc.id not in self._loc_devices:
+                devs = await _get_central_device_numbers(self._client, loc.external_id)
+                self._loc_devices[loc.id] = devs
+            for dn in self._loc_devices[loc.id]:
+                wanted[dn] = loc
+
+        # open new workers
+        for dn, loc in wanted.items():
+            if dn in self._workers and not self._workers[dn].done():
+                continue
+            task = asyncio.create_task(
+                _sse_worker(
+                    self._client,
+                    self._redis,
+                    dn,
+                    loc.id,
+                    loc.external_id,
+                    loc.name,
+                    loc.address,
+                    loc.latitude,
+                    loc.longitude,
+                ),
+                name=f"sse:{dn}",
+            )
+            self._workers[dn] = task
+
+        # cancel stale workers
+        stale = [dn for dn in self._workers if dn not in wanted]
+        for dn in stale:
+            self._workers[dn].cancel()
+            self._workers.pop(dn, None)
+
+        if stale or wanted:
+            log.debug("sse_tick", active=len(self._workers), wanted=len(wanted), stale=len(stale))
+
+    async def close(self) -> None:
+        for t in self._workers.values():
+            t.cancel()
+        await asyncio.gather(*self._workers.values(), return_exceptions=True)
+        self._workers.clear()
+
+
+# ---------- runner ----------
+
+async def _periodic(stop: asyncio.Event, interval: float, fn) -> None:
+    """Run coroutine `fn` every `interval` sec until `stop` is set."""
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        try:
+            await fn()
+        except Exception as e:
+            log.exception("periodic_failed", err=str(e))
+        dt = time.perf_counter() - t0
+        sleep_for = max(0.0, interval - dt)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=sleep_for)
+        except TimeoutError:
+            pass
+
+
+async def _runner() -> None:
+    settings = get_settings()
+    setup_logging(settings.log_level)
+    log.info(
+        "poller_start",
+        interval_sec=settings.poll_interval_sec,
+        operators=[o.value for o in SUPPORTED_OPERATORS_MVP],
+    )
+
+    stop = asyncio.Event()
+
+    def _handle_sig(*_: object) -> None:
+        stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handle_sig)
+        except NotImplementedError:
+            pass
+
+    redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+
+    async with ProviderClient(
+        settings.api_base,
+        timeout=settings.http_timeout_sec,
+        proxy_url=settings.http_proxy_url,
+        origin=settings.api_origin or None,
+        user_agent=settings.api_user_agent,
+    ) as client:
+        sse_mgr = SseManager(client, redis)
+        prev: dict[tuple[Operator, str], LocationStatus] = {}
+
+        async def rest_tick() -> None:
+            nonlocal prev
+            prev = await rest_diff_once(client, redis, prev)
+
+        async def catalog_tick() -> None:
+            await sync_central_catalog(client)
+
+        async def sse_tick() -> None:
+            await sse_mgr.tick()
+
+        # prime catalog once at start
+        await catalog_tick()
+
+        tasks = [
+            asyncio.create_task(_periodic(stop, settings.poll_interval_sec, rest_tick)),
+            asyncio.create_task(_periodic(stop, settings.catalog_sync_interval_sec, catalog_tick)),
+            asyncio.create_task(_periodic(stop, settings.sse_sync_interval_sec, sse_tick)),
+        ]
+        await stop.wait()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await sse_mgr.close()
+
+    await redis.aclose()
+    log.info("poller_stopped")
+
+
+def run() -> None:
+    asyncio.run(_runner())
+
+
+if __name__ == "__main__":
+    run()

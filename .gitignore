@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.har
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+docs/*.har
+docs/fiddler-session.har
+dist/
+build/
+.idea/
+.vscode/
+.claude/
+*.log
+
+# Scratch/reverse-engineering artifacts — never commit third-party blobs
+*.pdf
+*.js
+!src/**/*.js
+!docs/**/*.js

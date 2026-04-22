@@ -1,0 +1,445 @@
+﻿from __future__ import annotations
+
+import asyncio
+import contextlib
+import signal
+from datetime import datetime, timedelta, timezone
+
+import redis.asyncio as aioredis
+import structlog
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from bot.geo import find_nearby
+from bot.notifier import Notifier, tier_reaper
+from config import get_settings
+from db.models import (
+    Location,
+    NotificationLog,
+    Subscription,
+    SubscriptionMode,
+    Tier,
+    User,
+)
+from db.session import SessionLocal
+from logging_setup import setup_logging
+
+log = structlog.get_logger(__name__)
+dp = Dispatcher()
+
+
+# ---------- helpers ----------
+
+async def ensure_user(tg_id: int) -> User:
+    async with SessionLocal() as s:
+        stmt = (
+            pg_insert(User)
+            .values(tg_id=tg_id, tier=Tier.FREE.value)
+            .on_conflict_do_nothing(index_elements=["tg_id"])
+        )
+        await s.execute(stmt)
+        await s.commit()
+        user = await s.get(User, tg_id)
+    assert user is not None
+    return user
+
+
+def _effective_tier(user: User) -> str:
+    """Treat expired paid users as free without touching the DB."""
+    if (
+        user.tier == Tier.PAID.value
+        and user.paid_until
+        and user.paid_until < datetime.now(timezone.utc)
+    ):
+        return Tier.FREE.value
+    return user.tier
+
+
+def tier_limit(tier: str) -> int:
+    s = get_settings()
+    return s.paid_tier_max_subscriptions if tier == Tier.PAID.value else s.free_tier_max_subscriptions
+
+
+async def user_subscription_count(tg_id: int) -> int:
+    async with SessionLocal() as s:
+        result = await s.execute(
+            select(Subscription).where(Subscription.user_tg_id == tg_id)
+        )
+        return len(result.scalars().all())
+
+
+def _status_icon(status: str | None) -> str:
+    return {"AVAILABLE": "🟢", "FULLY_USED": "🔴", "UNAVAILABLE": "⚪"}.get(status or "", "❔")
+
+
+def _subscribe_kb(location_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔔 Подписаться", callback_data=f"sub:{location_id}")]
+        ]
+    )
+
+
+# ---------- handlers ----------
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await ensure_user(message.from_user.id)
+    s = get_settings()
+    await message.answer(
+        "Привет! Я отслеживаю свободные зарядные станции у вашего провайдера.\n\n"
+        "Команды:\n"
+        "• /nearby — ближайшие станции (нужна геолокация)\n"
+        "• /find <адрес или название> — поиск\n"
+        "• /list — мои подписки\n"
+        "• /unsubscribe <id> — снять подписку\n"
+        "• /status — мой тариф\n"
+        f"• /upgrade — платный тариф: {s.paid_tier_duration_days} дней за ⭐️{s.paid_tier_price_stars}\n"
+        "• /privacy — политика конфиденциальности\n"
+        "• /delete_me — удалить все свои данные\n\n"
+        f"Бесплатный тариф: {s.free_tier_max_subscriptions} подписка, "
+        f"уведомления с задержкой {s.free_tier_notify_delay_sec // 60} мин.\n"
+        f"Платный: до {s.paid_tier_max_subscriptions} подписок, уведомления мгновенно.\n\n"
+        "Это неофициальный сервис. Данные берутся с публичных эндпоинтов оператора."
+    )
+
+
+@dp.message(Command("privacy"))
+async def cmd_privacy(message: Message) -> None:
+    await message.answer(
+        "*Политика конфиденциальности*\n\n"
+        "Сервис хранит минимум данных:\n"
+        "• Ваш Telegram ID (без имени/телефона)\n"
+        "• Список ваших подписок (id локации)\n"
+        "• Лог отправленных уведомлений (для дедупа)\n\n"
+        "Данные не передаются третьим лицам и используются только для рассылки уведомлений. "
+        "Удалить все свои данные можно командой /delete_me — действие необратимо.\n\n"
+        "Сервис не является официальным от оператора зарядных станций. "
+        "Вопросы и жалобы — через /start → контакты автора.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("delete_me"))
+async def cmd_delete_me(message: Message) -> None:
+    if message.from_user is None:
+        return
+    tg_id = message.from_user.id
+    async with SessionLocal() as s:
+        # FK cascades will handle subs + notif log
+        await s.execute(delete(NotificationLog).where(
+            NotificationLog.subscription_id.in_(
+                select(Subscription.id).where(Subscription.user_tg_id == tg_id)
+            )
+        ))
+        await s.execute(delete(Subscription).where(Subscription.user_tg_id == tg_id))
+        await s.execute(delete(User).where(User.tg_id == tg_id))
+        await s.commit()
+    await message.answer("Все данные удалены. /start — начать заново.")
+
+
+@dp.message(Command("nearby"))
+async def cmd_nearby(message: Message) -> None:
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await message.answer("Пришли геолокацию — найду 10 ближайших станций.", reply_markup=kb)
+
+
+@dp.message(F.location)
+async def on_location(message: Message) -> None:
+    if message.from_user is None or message.location is None:
+        return
+    await ensure_user(message.from_user.id)
+    lat = message.location.latitude
+    lon = message.location.longitude
+    async with SessionLocal() as s:
+        hits = await find_nearby(s, lat, lon, radius_km=5.0, limit=10)
+    if not hits:
+        await message.answer("В радиусе 5 км ничего не нашёл.", reply_markup=ReplyKeyboardRemove())
+        return
+    await message.answer(
+        f"Нашёл {len(hits)} станций в радиусе 5 км:", reply_markup=ReplyKeyboardRemove()
+    )
+    for h in hits:
+        loc = h.location
+        text = (
+            f"{_status_icon(loc.last_status)} *{loc.name}*\n"
+            f"{loc.address}\n"
+            f"📏 {h.distance_km:.2f} км · сеть: {loc.operator}"
+        )
+        await message.answer(text, parse_mode="Markdown", reply_markup=_subscribe_kb(loc.id))
+
+
+@dp.message(Command("find"))
+async def cmd_find(message: Message, command: CommandObject) -> None:
+    q = (command.args or "").strip().lower()
+    if not q:
+        await message.answer("Укажи фрагмент адреса или названия. Пример: /find Минск Пулихова")
+        return
+    async with SessionLocal() as s:
+        rows = (
+            await s.execute(
+                select(Location)
+                .where(
+                    (Location.name.ilike(f"%{q}%")) | (Location.address.ilike(f"%{q}%"))
+                )
+                .limit(10)
+            )
+        ).scalars().all()
+    if not rows:
+        await message.answer("Ничего не нашёл. Попробуй другой запрос.")
+        return
+    for loc in rows:
+        text = (
+            f"{_status_icon(loc.last_status)} *{loc.name}*\n"
+            f"{loc.address}\n"
+            f"сеть: {loc.operator}"
+        )
+        await message.answer(text, parse_mode="Markdown", reply_markup=_subscribe_kb(loc.id))
+
+
+@dp.message(Command("list"))
+async def cmd_list(message: Message) -> None:
+    if message.from_user is None:
+        return
+    async with SessionLocal() as s:
+        rows = (
+            await s.execute(
+                select(Subscription, Location)
+                .join(Location, Subscription.location_id == Location.id, isouter=True)
+                .where(Subscription.user_tg_id == message.from_user.id)
+            )
+        ).all()
+    if not rows:
+        await message.answer("У тебя пока нет подписок. /nearby или /find + 🔔.")
+        return
+    lines = [
+        f"`{sub.id}` — {loc.name if loc else 'geo'} · {loc.last_status if loc else '—'}"
+        for sub, loc in rows
+    ]
+    await message.answer(
+        "\n".join(lines) + "\n\nСнять: /unsubscribe <id>", parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data.startswith("sub:"))
+async def on_sub_callback(cb: CallbackQuery) -> None:
+    if cb.from_user is None or cb.data is None:
+        return
+    try:
+        location_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Плохой id")
+        return
+    user = await ensure_user(cb.from_user.id)
+    tier = _effective_tier(user)
+    count = await user_subscription_count(user.tg_id)
+    if count >= tier_limit(tier):
+        await cb.answer(
+            f"Лимит подписок ({tier_limit(tier)}). Сними одну в /list или /upgrade.",
+            show_alert=True,
+        )
+        return
+    async with SessionLocal() as s:
+        loc = await s.get(Location, location_id)
+        if loc is None:
+            await cb.answer("Локация не найдена")
+            return
+        existing = (
+            await s.execute(
+                select(Subscription).where(
+                    Subscription.user_tg_id == user.tg_id,
+                    Subscription.location_id == location_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            await cb.answer("Уже подписан на эту локацию.")
+            return
+        sub = Subscription(
+            user_tg_id=user.tg_id,
+            mode=SubscriptionMode.LOCATION.value,
+            location_id=location_id,
+        )
+        s.add(sub)
+        await s.commit()
+    await cb.answer(f"Подписка оформлена: {loc.name}")
+
+
+@dp.callback_query(F.data.startswith("unsub:"))
+async def on_unsub_callback(cb: CallbackQuery) -> None:
+    if cb.from_user is None or cb.data is None:
+        return
+    try:
+        sub_id = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Плохой id")
+        return
+    async with SessionLocal() as s:
+        sub = await s.get(Subscription, sub_id)
+        if sub is None or sub.user_tg_id != cb.from_user.id:
+            await cb.answer("Подписка не найдена")
+            return
+        await s.delete(sub)
+        await s.commit()
+    await cb.answer("Подписка удалена ✔", show_alert=False)
+
+
+@dp.message(Command("unsubscribe"))
+async def cmd_unsubscribe(message: Message, command: CommandObject) -> None:
+    if message.from_user is None:
+        return
+    raw = (command.args or "").strip()
+    if not raw.isdigit():
+        await message.answer("Укажи id подписки из /list. Пример: /unsubscribe 42")
+        return
+    sub_id = int(raw)
+    async with SessionLocal() as s:
+        sub = await s.get(Subscription, sub_id)
+        if sub is None or sub.user_tg_id != message.from_user.id:
+            await message.answer("Подписка не найдена.")
+            return
+        await s.delete(sub)
+        await s.commit()
+    await message.answer("Подписка удалена.")
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    if message.from_user is None:
+        return
+    user = await ensure_user(message.from_user.id)
+    tier = _effective_tier(user)
+    lines = [f"Тариф: *{tier}*"]
+    if user.paid_until:
+        lines.append(f"Действует до: {user.paid_until:%Y-%m-%d %H:%M UTC}")
+    lines.append(f"Лимит подписок: {tier_limit(tier)}")
+    if tier == Tier.FREE.value:
+        s = get_settings()
+        lines.append(
+            f"\n/upgrade — {s.paid_tier_duration_days} дней за ⭐️{s.paid_tier_price_stars}"
+        )
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("upgrade"))
+async def cmd_upgrade(message: Message) -> None:
+    if message.from_user is None:
+        return
+    s = get_settings()
+    await message.answer_invoice(
+        title="Charger Watcher — Paid",
+        description=(
+            f"{s.paid_tier_duration_days} дней: до {s.paid_tier_max_subscriptions} подписок, "
+            "мгновенные уведомления без задержки."
+        ),
+        prices=[LabeledPrice(label="Подписка", amount=s.paid_tier_price_stars)],
+        currency="XTR",
+        payload=f"paid:{s.paid_tier_duration_days}",
+        provider_token="",
+    )
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery) -> None:
+    await q.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def on_paid(message: Message) -> None:
+    if message.from_user is None or message.successful_payment is None:
+        return
+    payload = message.successful_payment.invoice_payload or ""
+    try:
+        days = int(payload.split(":", 1)[1])
+    except (ValueError, IndexError):
+        days = get_settings().paid_tier_duration_days
+
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as s:
+        user = await s.get(User, message.from_user.id)
+        if user is None:
+            user = User(tg_id=message.from_user.id, tier=Tier.PAID.value, paid_until=now + timedelta(days=days))
+            s.add(user)
+        else:
+            base = user.paid_until if user.paid_until and user.paid_until > now else now
+            user.tier = Tier.PAID.value
+            user.paid_until = base + timedelta(days=days)
+        await s.commit()
+    await message.answer(
+        "✅ Оплата получена. Лимит подписок увеличен, уведомления без задержки."
+    )
+    log.info("payment_ok", user=message.from_user.id, days=days)
+
+
+@dp.message(F.text)
+async def fallback(message: Message) -> None:
+    await message.answer("Не понял. Набери /start для списка команд.")
+
+
+# ---------- runner ----------
+
+async def _runner() -> None:
+    settings = get_settings()
+    setup_logging(settings.log_level)
+    if not settings.tg_bot_token:
+        raise RuntimeError("TG_BOT_TOKEN is not set")
+    bot = Bot(settings.tg_bot_token)
+    redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+
+    stop = asyncio.Event()
+
+    def _sig(*_: object) -> None:
+        stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _sig)
+        except NotImplementedError:
+            pass
+
+    notifier = Notifier(bot, redis)
+    bg_tasks = [
+        asyncio.create_task(notifier.consume_events(stop), name="notifier-consume"),
+        asyncio.create_task(notifier.delayed_worker(stop), name="notifier-delayed"),
+        asyncio.create_task(tier_reaper(stop), name="tier-reaper"),
+    ]
+    log.info("bot_start")
+    try:
+        await dp.start_polling(bot, handle_signals=False)
+    finally:
+        stop.set()
+        for t in bg_tasks:
+            t.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+        await redis.aclose()
+        await bot.session.close()
+        log.info("bot_stopped")
+
+
+def run() -> None:
+    asyncio.run(_runner())
+
+
+if __name__ == "__main__":
+    run()

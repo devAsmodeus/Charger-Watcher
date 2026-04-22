@@ -1,0 +1,64 @@
+name: charger-watcher
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-charger}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-charger}
+      POSTGRES_DB: ${POSTGRES_DB:-charger}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    # Uncomment to expose PG on host for local psql/pgcli; keep off if port busy.
+    # ports:
+    #   - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # ports:
+    #   - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  poller:
+    build: .
+    restart: unless-stopped
+    command: python -m poller.main
+    env_file: .env
+    # Optional DNS override for the external API when running in a
+    # network where public DNS for the provider cannot be resolved
+    # (VPN kill-switch, restricted LAN, …). Format: "host:ip".
+    # Set API_HOST and API_HOST_IP in .env; leave empty to disable.
+    extra_hosts:
+      - "${API_HOST:-_disabled}:${API_HOST_IP:-127.0.0.1}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  bot:
+    build: .
+    restart: unless-stopped
+    command: python -m bot.main
+    env_file: .env
+    extra_hosts:
+      - "${API_HOST:-_disabled}:${API_HOST_IP:-127.0.0.1}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pg_data:
