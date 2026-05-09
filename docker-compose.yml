@@ -39,7 +39,8 @@ services:
       redis:
         condition: service_healthy
 
-  # VPN-туннель через CyberGhost (Frankfurt) — для bot, чтобы обойти РКН-блок Telegram API
+  # VPN-туннель через CyberGhost (US) — для bot (TG-API из РФ) и для Claude Code на хосте
+  # (HTTP-прокси на 127.0.0.1:8888). Регион задаётся файлом vpn/openvpn.ovpn.
   gluetun:
     image: qmcgaw/gluetun:latest
     container_name: charger-watcher-gluetun
@@ -56,7 +57,13 @@ services:
       - OPENVPN_PASSWORD=${OPENVPN_PASSWORD}
       # Разрешить bot-у достучаться до postgres/redis по docker-сети
       - FIREWALL_OUTBOUND_SUBNETS=172.18.0.0/16
+      # HTTP-прокси наружу через VPN — для Claude Code, который работает на хосте
+      - HTTPPROXY=on
+      - HTTPPROXY_LISTENING_ADDRESS=:8888
       - TZ=Europe/Minsk
+    ports:
+      # Прокси биндим только на loopback — снаружи недоступен, аутентификация не нужна
+      - "127.0.0.1:8888:8888"
     volumes:
       - ./vpn:/gluetun
     healthcheck:
