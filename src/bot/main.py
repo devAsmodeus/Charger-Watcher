@@ -25,6 +25,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bot.geo import find_nearby
 from bot.notifier import Notifier, tier_reaper
+from bot.onboarding import (
+    GREETING_NEW,
+    GREETING_RETURNING,
+    about_text,
+    onboarding_kb,
+)
 from config import get_settings
 from db.models import (
     Location,
@@ -55,6 +61,24 @@ async def ensure_user(tg_id: int) -> User:
         user = await s.get(User, tg_id)
     assert user is not None
     return user
+
+
+async def ensure_user_with_flag(tg_id: int) -> tuple[User, bool]:
+    """Like ensure_user but also returns True iff this is a brand-new row."""
+    async with SessionLocal() as s:
+        existing = await s.get(User, tg_id)
+        if existing is not None:
+            return existing, False
+        stmt = (
+            pg_insert(User)
+            .values(tg_id=tg_id, tier=Tier.FREE.value)
+            .on_conflict_do_nothing(index_elements=["tg_id"])
+        )
+        await s.execute(stmt)
+        await s.commit()
+        user = await s.get(User, tg_id)
+    assert user is not None
+    return user, True
 
 
 def _effective_tier(user: User) -> str:
@@ -99,24 +123,9 @@ def _subscribe_kb(location_id: int) -> InlineKeyboardMarkup:
 async def cmd_start(message: Message) -> None:
     if message.from_user is None:
         return
-    await ensure_user(message.from_user.id)
-    s = get_settings()
-    await message.answer(
-        "Привет! Я отслеживаю свободные зарядные станции у вашего провайдера.\n\n"
-        "Команды:\n"
-        "• /nearby — ближайшие станции (нужна геолокация)\n"
-        "• /find <адрес или название> — поиск\n"
-        "• /list — мои подписки\n"
-        "• /unsubscribe <id> — снять подписку\n"
-        "• /status — мой тариф\n"
-        f"• /upgrade — платный тариф: {s.paid_tier_duration_days} дней за ⭐️{s.paid_tier_price_stars}\n"
-        "• /privacy — политика конфиденциальности\n"
-        "• /delete_me — удалить все свои данные\n\n"
-        f"Бесплатный тариф: {s.free_tier_max_subscriptions} подписка, "
-        f"уведомления с задержкой {s.free_tier_notify_delay_sec // 60} мин.\n"
-        f"Платный: до {s.paid_tier_max_subscriptions} подписок, уведомления мгновенно.\n\n"
-        "Это неофициальный сервис. Данные берутся с публичных эндпоинтов оператора."
-    )
+    _, is_new = await ensure_user_with_flag(message.from_user.id)
+    greeting = GREETING_NEW if is_new else GREETING_RETURNING
+    await message.answer(greeting, reply_markup=onboarding_kb())
 
 
 @dp.message(Command("privacy"))
@@ -153,14 +162,18 @@ async def cmd_delete_me(message: Message) -> None:
     await message.answer("Все данные удалены. /start — начать заново.")
 
 
-@dp.message(Command("nearby"))
-async def cmd_nearby(message: Message) -> None:
+async def _send_nearby_prompt(message: Message) -> None:
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
     await message.answer("Пришли геолокацию — найду 10 ближайших станций.", reply_markup=kb)
+
+
+@dp.message(Command("nearby"))
+async def cmd_nearby(message: Message) -> None:
+    await _send_nearby_prompt(message)
 
 
 @dp.message(F.location)
@@ -216,28 +229,41 @@ async def cmd_find(message: Message, command: CommandObject) -> None:
         await message.answer(text, parse_mode="Markdown", reply_markup=_subscribe_kb(loc.id))
 
 
-@dp.message(Command("list"))
-async def cmd_list(message: Message) -> None:
-    if message.from_user is None:
-        return
+async def _send_list(message: Message, tg_id: int) -> None:
     async with SessionLocal() as s:
         rows = (
             await s.execute(
                 select(Subscription, Location)
                 .join(Location, Subscription.location_id == Location.id, isouter=True)
-                .where(Subscription.user_tg_id == message.from_user.id)
+                .where(Subscription.user_tg_id == tg_id)
             )
         ).all()
     if not rows:
         await message.answer("У тебя пока нет подписок. /nearby или /find + 🔔.")
         return
     lines = [
-        f"`{sub.id}` — {loc.name if loc else 'geo'} · {loc.last_status if loc else '—'}"
+        f"• {(loc.name if loc else 'geo')} — {(loc.last_status if loc and loc.last_status else 'статус неизвестен')}"
         for sub, loc in rows
     ]
-    await message.answer(
-        "\n".join(lines) + "\n\nСнять: /unsubscribe <id>", parse_mode="Markdown"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"❌ Снять «{(loc.name if loc else 'geo')[:40]}»",
+                    callback_data=f"unsub:{sub.id}",
+                )
+            ]
+            for sub, loc in rows
+        ]
     )
+    await message.answer("Твои подписки:\n" + "\n".join(lines), reply_markup=kb)
+
+
+@dp.message(Command("list"))
+async def cmd_list(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await _send_list(message, message.from_user.id)
 
 
 @dp.callback_query(F.data.startswith("sub:"))
@@ -303,6 +329,40 @@ async def on_unsub_callback(cb: CallbackQuery) -> None:
     await cb.answer("Подписка удалена ✔", show_alert=False)
 
 
+@dp.callback_query(F.data.startswith("onboard:"))
+async def on_onboard_callback(cb: CallbackQuery) -> None:
+    if cb.from_user is None or cb.data is None or cb.message is None:
+        return
+    action = cb.data.split(":", 1)[1]
+    msg = cb.message  # the bot's greeting message; reply via .answer()
+
+    if action == "nearby":
+        await cb.answer()
+        await _send_nearby_prompt(msg)
+        return
+    if action == "find":
+        await cb.answer()
+        await msg.answer(
+            "Пришли адрес или название одним сообщением и команду /find перед ним.\n"
+            "Пример: `/find Минск Пулихова`",
+            parse_mode="Markdown",
+        )
+        return
+    if action == "list":
+        await cb.answer()
+        await _send_list(msg, cb.from_user.id)
+        return
+    if action == "upgrade":
+        await cb.answer()
+        await _send_upgrade_invoice(msg)
+        return
+    if action == "about":
+        await cb.answer()
+        await msg.answer(about_text(), parse_mode="HTML")
+        return
+    await cb.answer("Неизвестное действие")
+
+
 @dp.message(Command("unsubscribe"))
 async def cmd_unsubscribe(message: Message, command: CommandObject) -> None:
     if message.from_user is None:
@@ -340,10 +400,7 @@ async def cmd_status(message: Message) -> None:
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
-@dp.message(Command("upgrade"))
-async def cmd_upgrade(message: Message) -> None:
-    if message.from_user is None:
-        return
+async def _send_upgrade_invoice(message: Message) -> None:
     s = get_settings()
     await message.answer_invoice(
         title="Charger Watcher — Paid",
@@ -356,6 +413,13 @@ async def cmd_upgrade(message: Message) -> None:
         payload=f"paid:{s.paid_tier_duration_days}",
         provider_token="",
     )
+
+
+@dp.message(Command("upgrade"))
+async def cmd_upgrade(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await _send_upgrade_invoice(message)
 
 
 @dp.pre_checkout_query()
