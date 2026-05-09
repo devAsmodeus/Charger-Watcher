@@ -26,6 +26,12 @@ log = structlog.get_logger(__name__)
 
 EVENTS_STREAM = "charger:events"
 
+# Redis keys for restart-safe state. Without these, the first poll/SSE
+# heartbeat after a restart is treated as the baseline and any transition
+# that happened during downtime is silently lost — a missed notification.
+REST_PREV_HASH = "poller:rest:prev"  # field "<operator>:<external_id>" -> status
+SSE_FREE_HASH = "poller:sse:last_any_free"  # field "<device_number>" -> "1" / "0"
+
 
 # ---------- location catalog ----------
 
@@ -88,6 +94,68 @@ async def publish_event(redis: aioredis.Redis, payload: dict) -> None:
 
 # ---------- REST diff loop (Evika / Battery-fly) ----------
 
+def _prev_field(op: Operator, ext_id: str) -> str:
+    return f"{op.value}:{ext_id}"
+
+
+async def load_rest_prev(
+    redis: aioredis.Redis,
+) -> dict[tuple[Operator, str], LocationStatus]:
+    """Hydrate REST diff state from Redis.
+
+    Without this, after a restart the first poll has empty ``prev``, so
+    every transition that happened during downtime is silently lost. We
+    persist the last observed status per (operator, external_id) and
+    re-load it on boot so the very first diff still detects transitions
+    that occurred while the poller was down.
+    """
+    raw = await redis.hgetall(REST_PREV_HASH)
+    out: dict[tuple[Operator, str], LocationStatus] = {}
+    valid_ops = {o.value: o for o in Operator}
+    for field, value in raw.items():
+        if not isinstance(field, str) or ":" not in field:
+            continue
+        op_str, _, ext_id = field.partition(":")
+        op = valid_ops.get(op_str)
+        if op is None or not ext_id:
+            continue
+        try:
+            status = LocationStatus(value)
+        except ValueError:
+            continue
+        out[(op, ext_id)] = status
+    if out:
+        log.info("rest_prev_loaded", entries=len(out))
+    return out
+
+
+async def save_rest_prev(
+    redis: aioredis.Redis,
+    new_state: dict[tuple[Operator, str], LocationStatus],
+    old_state: dict[tuple[Operator, str], LocationStatus],
+) -> None:
+    """Persist current REST diff state to Redis.
+
+    Writes only what changed and removes keys that disappeared from the
+    upstream listing so the hash doesn't grow unbounded.
+    """
+    pipe = redis.pipeline()
+    touched = False
+    for key, status in new_state.items():
+        if old_state.get(key) is status:
+            continue
+        op, ext_id = key
+        await pipe.hset(REST_PREV_HASH, _prev_field(op, ext_id), status.value)
+        touched = True
+    # remove fields for locations that disappeared from upstream
+    removed = [k for k in old_state if k not in new_state]
+    for op, ext_id in removed:
+        await pipe.hdel(REST_PREV_HASH, _prev_field(op, ext_id))
+        touched = True
+    if touched:
+        await pipe.execute()
+
+
 async def rest_diff_once(
     client: ProviderClient,
     redis: aioredis.Redis,
@@ -143,6 +211,9 @@ async def rest_diff_once(
                 to=item.status.value,
             )
 
+    # Persist for restart-safety. Done in one shot at end of the cycle so
+    # we're not paying a roundtrip per location.
+    await save_rest_prev(redis, new_state, prev)
     return new_state
 
 
@@ -185,8 +256,15 @@ async def _sse_worker(
     log.info("sse_open", device=device_number, ext=external_id)
     # per-connector last seen OCPP status
     last: dict[int, str] = {}
-    # derived: is *any* connector of this device currently Available
+    # derived: is *any* connector of this device currently Available.
+    # Bootstrap from Redis so a station that was already free at restart
+    # still fires when the next heartbeat differs from the persisted state.
     last_any_free: bool | None = None
+    persisted = await redis.hget(SSE_FREE_HASH, str(device_number))
+    if persisted == "1":
+        last_any_free = True
+    elif persisted == "0":
+        last_any_free = False
     backoff = 1.0  # exponential reconnect backoff (seconds), cap at 60
 
     while True:
@@ -202,11 +280,21 @@ async def _sse_worker(
 
                 if last_any_free is None:
                     last_any_free = any_free
+                    # Seed Redis on first frame so that across restarts we
+                    # always have a baseline to diff against.
+                    await redis.hset(
+                        SSE_FREE_HASH, str(device_number), "1" if any_free else "0"
+                    )
                     continue
                 if any_free == last_any_free:
                     continue
 
                 last_any_free = any_free
+                # Persist the new baseline so a restart between this frame
+                # and the next one does not lose the transition signal.
+                await redis.hset(
+                    SSE_FREE_HASH, str(device_number), "1" if any_free else "0"
+                )
                 if any_free:
                     # location transitioned to having at least one free connector
                     now = int(time.time())
@@ -374,7 +462,10 @@ async def _runner() -> None:
         user_agent=settings.api_user_agent,
     ) as client:
         sse_mgr = SseManager(client, redis)
-        prev: dict[tuple[Operator, str], LocationStatus] = {}
+        # Restore last-known REST state from Redis so the very first diff
+        # after a restart can still detect transitions that happened
+        # while the poller was down.
+        prev: dict[tuple[Operator, str], LocationStatus] = await load_rest_prev(redis)
 
         async def rest_tick() -> None:
             nonlocal prev
