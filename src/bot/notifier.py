@@ -1,13 +1,13 @@
-﻿"""Event consumer and notification dispatcher.
+"""Event consumer and notification dispatcher.
 
 Pipeline:
     Redis Stream "charger:events"   (from poller)
         │
         ▼
-    notifier_loop(xread, block=5s)
+    consume_events: XREADGROUP (consumer group "notifier-group")
         │
         ▼
-    _dispatch_event(event)
+    dispatch_event(event)
         - paid subscribers → Telegram immediately (rate-limited)
         - free subscribers → Redis ZSET "charger:notify:delayed"
                              with score = now + FREE_TIER_NOTIFY_DELAY_SEC
@@ -17,8 +17,26 @@ Pipeline:
         - before sending, also ZREM if the location became non-AVAILABLE
           meanwhile (canceling stale notifications)
 
-Dedup via notification_log(subscription_id, location_id, event_epoch).
-Cooldown via notification_log.sent_at > now() - NOTIFY_COOLDOWN_SEC.
+Reliability invariants
+----------------------
+
+1. Cooldown is enforced via `notification_log.delivered_at IS NOT NULL`. We
+   *claim* a row before sending (insert with delivered_at = NULL) and
+   *commit* it (UPDATE delivered_at = now()) only on send success. On send
+   failure we DELETE the claim — the cooldown is NOT consumed by failed
+   deliveries. This prevents the "silent message loss" class of bug where a
+   transient Telegram 5xx / VPN flake would lock the user out for the full
+   cooldown window.
+
+   The unique constraint (subscription_id, location_id, event_epoch) still
+   protects against two concurrent dispatches racing for the same event —
+   only one will succeed in inserting and the other will see the conflict
+   and skip.
+
+2. Stream consumption uses a Redis consumer group with explicit XACK so
+   that messages enqueued while the bot was down are still delivered when
+   it comes back up. The previous "$" cursor dropped every in-flight event
+   between poller PUBLISH and bot restart.
 """
 from __future__ import annotations
 
@@ -32,7 +50,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiolimiter import AsyncLimiter
-from sqlalchemy import and_, select
+from sqlalchemy import and_, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import get_settings
@@ -52,6 +70,10 @@ DELAYED_ZSET = "charger:notify:delayed"
 # Marker of the *current* status of a location — updated on every event.
 # Used by the delayed-worker to cancel free notifications that became stale.
 STATUS_HASH = "charger:location_status"
+
+# Redis consumer group / consumer for restart-safe stream consumption.
+NOTIFIER_GROUP = "notifier-group"
+NOTIFIER_CONSUMER = "notifier-1"
 
 
 def _status_icon(status: str | None) -> str:
@@ -86,7 +108,6 @@ class Notifier:
         self.settings = get_settings()
         # Telegram global limit ~30 msg/sec. Keep headroom, per user 1 msg/sec max.
         self._limiter = AsyncLimiter(self.settings.tg_send_rate_per_sec, 1)
-        self._last_stream_id = "$"
 
     # -------- sending --------
 
@@ -114,18 +135,26 @@ class Notifier:
 
     # -------- dedup/cooldown --------
 
-    async def _can_notify(
+    async def _claim_slot(
         self, sub_id: int, loc_id: int, event_epoch: int
     ) -> bool:
-        """True iff there's no dedup/cooldown violation for (sub, loc).
+        """Reserve the (sub, loc, event) slot.
 
-        Atomic: inside one transaction we check cooldown and try to insert
-        the log row. If either check fails, we don't emit a notification.
+        Returns True iff the caller now owns the row and should attempt to
+        send. False means either:
+          - cooldown is currently active for a *delivered* row, OR
+          - some concurrent dispatcher already claimed this exact event.
+
+        The row is inserted with ``delivered_at = NULL``. Cooldown is only
+        enforced against rows where ``delivered_at IS NOT NULL`` so that a
+        failed send (followed by ``release_slot``) does not poison subsequent
+        legitimate retries.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(
             seconds=self.settings.notify_cooldown_sec
         )
         async with SessionLocal() as s:
+            # Cooldown applies only to *successful* prior deliveries.
             recent = (
                 await s.execute(
                     select(NotificationLog.id)
@@ -133,14 +162,15 @@ class Notifier:
                         and_(
                             NotificationLog.subscription_id == sub_id,
                             NotificationLog.location_id == loc_id,
-                            NotificationLog.sent_at >= cutoff,
+                            NotificationLog.delivered_at.is_not(None),
+                            NotificationLog.delivered_at >= cutoff,
                         )
                     )
                     .limit(1)
                 )
             ).first()
             if recent is not None:
-                return False  # cooldown
+                return False  # cooldown still active
 
             ins = (
                 pg_insert(NotificationLog)
@@ -148,6 +178,7 @@ class Notifier:
                     subscription_id=sub_id,
                     location_id=loc_id,
                     event_epoch=event_epoch,
+                    delivered_at=None,
                 )
                 .on_conflict_do_nothing(
                     index_elements=["subscription_id", "location_id", "event_epoch"]
@@ -156,6 +187,67 @@ class Notifier:
             result = await s.execute(ins)
             await s.commit()
             return result.rowcount > 0
+
+    async def _commit_delivery(
+        self, sub_id: int, loc_id: int, event_epoch: int
+    ) -> None:
+        """Mark a previously claimed slot as delivered (cooldown now active)."""
+        async with SessionLocal() as s:
+            await s.execute(
+                update(NotificationLog)
+                .where(
+                    and_(
+                        NotificationLog.subscription_id == sub_id,
+                        NotificationLog.location_id == loc_id,
+                        NotificationLog.event_epoch == event_epoch,
+                    )
+                )
+                .values(delivered_at=datetime.now(timezone.utc))
+            )
+            await s.commit()
+
+    async def _release_slot(
+        self, sub_id: int, loc_id: int, event_epoch: int
+    ) -> None:
+        """Release a claim because the send failed.
+
+        We DELETE rather than NULL-out a flag, because keeping an
+        undelivered row around would be visually indistinguishable from a
+        live claim by another worker, and would block legitimate retries on
+        the next event.
+        """
+        async with SessionLocal() as s:
+            await s.execute(
+                delete(NotificationLog).where(
+                    and_(
+                        NotificationLog.subscription_id == sub_id,
+                        NotificationLog.location_id == loc_id,
+                        NotificationLog.event_epoch == event_epoch,
+                        NotificationLog.delivered_at.is_(None),
+                    )
+                )
+            )
+            await s.commit()
+
+    async def _send_with_slot(
+        self,
+        tg_id: int,
+        sub_id: int,
+        loc_id: int,
+        event_epoch: int,
+        text: str,
+    ) -> bool:
+        """Send + book-keep the cooldown slot atomically wrt failure.
+
+        On success: UPDATE delivered_at -> now() (cooldown begins).
+        On failure: DELETE the claim row so the next event isn't blocked.
+        """
+        ok = await self._send(tg_id, text, _unsub_keyboard(sub_id))
+        if ok:
+            await self._commit_delivery(sub_id, loc_id, event_epoch)
+        else:
+            await self._release_slot(sub_id, loc_id, event_epoch)
+        return ok
 
     # -------- event dispatch --------
 
@@ -194,18 +286,19 @@ class Notifier:
             tier = user.tier
             if tier == Tier.PAID.value and user.paid_until and user.paid_until < now:
                 tier = Tier.FREE.value
-            if not await self._can_notify(sub.id, loc_id, event_epoch):
+            if not await self._claim_slot(sub.id, loc_id, event_epoch):
                 continue
             if tier == Tier.PAID.value:
                 paid_ready.append((user.tg_id, sub.id))
             else:
                 free_ready.append((user.tg_id, sub.id))
 
-        # paid → send now
+        # paid → send now (commit cooldown only on success)
         for tg_id, sub_id in paid_ready:
-            await self._send(tg_id, text, _unsub_keyboard(sub_id))
+            await self._send_with_slot(tg_id, sub_id, loc_id, event_epoch, text)
 
-        # free → schedule via Redis ZSET
+        # free → schedule via Redis ZSET; the slot stays "claimed" until the
+        # delayed_worker either delivers (commit) or cancels/fails (release).
         if free_ready:
             delay_ts = int(now.timestamp()) + self.settings.free_tier_notify_delay_sec
             payload = {
@@ -235,19 +328,30 @@ class Notifier:
                 except Exception:
                     continue
 
-                # cancel if meanwhile the location became non-AVAILABLE
-                cur_status = await self.redis.hget(STATUS_HASH, str(payload["location_id"]))
+                loc_id = int(payload["location_id"])
+                event_epoch = int(payload["event_epoch"])
+
+                # cancel if meanwhile the location became non-AVAILABLE.
+                # IMPORTANT: when cancelling we must RELEASE the cooldown
+                # claims for every subscription, otherwise the next
+                # legitimate AVAILABLE within the cooldown window would be
+                # silently swallowed.
+                cur_status = await self.redis.hget(STATUS_HASH, str(loc_id))
                 if cur_status and cur_status != "AVAILABLE":
                     log.info(
                         "free_notify_cancelled",
-                        location=payload["location_id"],
+                        location=loc_id,
                         current_status=cur_status,
                     )
+                    for _tg, sub_id in payload["tg_ids_subs"]:
+                        await self._release_slot(sub_id, loc_id, event_epoch)
                     continue
 
                 text = payload["text"]
                 for tg_id, sub_id in payload["tg_ids_subs"]:
-                    await self._send(tg_id, text, _unsub_keyboard(sub_id))
+                    await self._send_with_slot(
+                        tg_id, sub_id, loc_id, event_epoch, text
+                    )
 
             try:
                 await asyncio.wait_for(stop.wait(), timeout=5.0)
@@ -256,30 +360,91 @@ class Notifier:
 
     # -------- main loop --------
 
+    async def _ensure_consumer_group(self) -> None:
+        """Create the consumer group if it doesn't exist.
+
+        ``mkstream=True`` means the stream is created on demand if the
+        notifier boots before the poller has produced its first event.
+        Subsequent calls return BUSYGROUP — we swallow that.
+        """
+        try:
+            await self.redis.xgroup_create(
+                EVENTS_STREAM, NOTIFIER_GROUP, id="0", mkstream=True
+            )
+            log.info("xgroup_created", stream=EVENTS_STREAM, group=NOTIFIER_GROUP)
+        except aioredis.ResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+
     async def consume_events(self, stop: asyncio.Event) -> None:
-        """XREAD loop — consume events into dispatch_event."""
+        """XREADGROUP loop — consume events into dispatch_event.
+
+        Restart-safe: any messages produced while the consumer was down (or
+        produced & not yet acked on a previous crash) are replayed via the
+        ">"" cursor / pending-list semantics of consumer groups.
+
+        We first drain anything that was claimed by this consumer name on a
+        previous run but never acked (id "0"), then switch to fresh-only
+        (">"") for normal operation.
+        """
+        await self._ensure_consumer_group()
+
+        # On startup, drain pending entries for this consumer (if any) so we
+        # don't miss anything that was delivered to us but not acked before
+        # the previous crash.
+        cursor = "0"
         while not stop.is_set():
             try:
-                resp = await self.redis.xread(
-                    {EVENTS_STREAM: self._last_stream_id}, block=5_000, count=50
+                resp = await self.redis.xreadgroup(
+                    NOTIFIER_GROUP,
+                    NOTIFIER_CONSUMER,
+                    {EVENTS_STREAM: cursor},
+                    block=5_000,
+                    count=50,
                 )
-            except Exception as e:  # noqa: BLE001
-                log.warning("xread_failed", err=str(e))
+            except aioredis.ResponseError as e:
+                # Group was deleted out from under us; recreate.
+                if "NOGROUP" in str(e):
+                    log.warning("xreadgroup_nogroup", err=str(e))
+                    await self._ensure_consumer_group()
+                    continue
+                log.warning("xreadgroup_failed", err=str(e))
                 await asyncio.sleep(1)
                 continue
-            if not resp:
+            except Exception as e:  # noqa: BLE001
+                log.warning("xreadgroup_failed", err=str(e))
+                await asyncio.sleep(1)
                 continue
+
+            if not resp:
+                # Pending list drained (or no live entries within block).
+                # Either way we want the live tail next.
+                cursor = ">"
+                continue
+
+            total_entries = 0
             for _, entries in resp:
+                total_entries += len(entries)
                 for msg_id, fields in entries:
-                    self._last_stream_id = msg_id
                     try:
                         event = orjson.loads(fields["data"])
                     except Exception:
+                        # Unparseable — ack to drop, otherwise we'd retry forever.
+                        await self.redis.xack(EVENTS_STREAM, NOTIFIER_GROUP, msg_id)
                         continue
                     try:
                         await self.dispatch_event(event)
                     except Exception as e:  # noqa: BLE001
                         log.exception("dispatch_failed", err=str(e))
+                        # Do NOT ack on dispatch failure — the entry stays
+                        # in the pending list and will be retried on the
+                        # next loop iteration / restart.
+                        continue
+                    await self.redis.xack(EVENTS_STREAM, NOTIFIER_GROUP, msg_id)
+
+            # Once the pending list yields nothing new, move to live tail.
+            if cursor == "0" and total_entries == 0:
+                cursor = ">"
 
 
 async def tier_reaper(stop: asyncio.Event) -> None:

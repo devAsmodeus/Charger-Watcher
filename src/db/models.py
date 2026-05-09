@@ -112,6 +112,14 @@ class NotificationLog(Base):
     # Epoch of the event the notification was caused by. Identical across recipients
     # of the same event — used to dedupe retries.
     event_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Time the row was *claimed* (insert moment). Used to expire stale claims
+    # whose delivery never completed (process crash between insert and send).
     sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # NULL until the Telegram send actually succeeded. Cooldown only honors
+    # rows where delivered_at IS NOT NULL — a failed send does NOT poison the
+    # cooldown window. See _can_notify / _commit_delivery in notifier.py.
+    delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
     )
