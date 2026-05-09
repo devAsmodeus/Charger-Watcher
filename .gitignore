@@ -17,6 +17,12 @@ build/
 .claude/
 *.log
 
+# Secrets — VPN credentials, never commit
+vpn/
+
+# Local backups
+*.bak
+
 # Scratch/reverse-engineering artifacts — never commit third-party blobs
 *.pdf
 *.js
