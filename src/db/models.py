@@ -78,14 +78,49 @@ class Subscription(Base):
     anchor_latitude: Mapped[float | None] = mapped_column(Float, default=None)
     anchor_longitude: Mapped[float | None] = mapped_column(Float, default=None)
     radius_meters: Mapped[int | None] = mapped_column(default=None)
-    # Optional filter by connector type (human label from /connectors/types).
+    # Optional filter by connector type (human label from LocationDetail).
+    # NULL = подписка на любой свободный коннектор.
     connector_type: Mapped[str | None] = mapped_column(String(64), default=None)
+    # Сколько ещё уведомлений нужно отправить по этой подписке. NULL = ∞.
+    # Декремент через инкремент notify_count в notifier-е после успешной
+    # доставки; при notify_count >= notify_limit подписка удаляется.
+    notify_limit: Mapped[int | None] = mapped_column(default=None)
+    notify_count: Mapped[int] = mapped_column(
+        default=0, server_default="0", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     user: Mapped[User] = relationship(back_populates="subscriptions")
     location: Mapped[Location | None] = relationship()
+
+
+class Payment(Base):
+    """Журнал Stars-платежей. Хранит charge_id для Refund Policy.
+
+    user_tg_id — nullable: после /delete_me ссылка на юзера обнуляется,
+    но запись о платеже остаётся для бухгалтерии (legal).
+    """
+
+    __tablename__ = "payments"
+    __table_args__ = (Index("ix_payments_user", "user_tg_id"),)
+
+    charge_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_tg_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.tg_id", ondelete="SET NULL"),
+        default=None,
+    )
+    amount_stars: Mapped[int] = mapped_column(nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    payload: Mapped[str] = mapped_column(String(64), nullable=False)
+    paid_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    refunded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
 
 
 class NotificationLog(Base):
