@@ -41,6 +41,7 @@ Reliability invariants
 from __future__ import annotations
 
 import asyncio
+import html
 from datetime import datetime, timedelta, timezone
 
 import orjson
@@ -81,10 +82,19 @@ def _status_icon(status: str | None) -> str:
 
 
 def _format_alert(event: dict) -> str:
+    """HTML-форматирование с эскейпом name/address.
+
+    Markdown ломается на любой `_`/`*`/`[` в адресе, и тогда send падает,
+    cooldown release-ится, на следующем переходе всё повторяется — silent
+    loss для конкретной локации навсегда. HTML escape отрезает этот класс.
+    """
+    name = html.escape(str(event.get("name", "")))
+    address = html.escape(str(event.get("address", "")))
+    operator = html.escape(str(event.get("operator", "")))
     return (
-        f"🟢 Освободилась: *{event['name']}*\n"
-        f"{event['address']}\n"
-        f"Сеть: {event['operator']} · 📍 {event['lat']:.5f}, {event['lon']:.5f}"
+        f"🟢 Освободилась: <b>{name}</b>\n"
+        f"{address}\n"
+        f"Сеть: {operator} · 📍 {event['lat']:.5f}, {event['lon']:.5f}"
     )
 
 
@@ -111,11 +121,17 @@ class Notifier:
 
     # -------- sending --------
 
-    async def _send(self, tg_id: int, text: str, keyboard: InlineKeyboardMarkup | None) -> bool:
+    async def _send(
+        self,
+        tg_id: int,
+        text: str,
+        keyboard: InlineKeyboardMarkup | None,
+        parse_mode: str | None = "HTML",
+    ) -> bool:
         async with self._limiter:
             try:
                 await self.bot.send_message(
-                    tg_id, text, parse_mode="Markdown", reply_markup=keyboard
+                    tg_id, text, parse_mode=parse_mode, reply_markup=keyboard
                 )
                 return True
             except TelegramRetryAfter as e:
@@ -123,7 +139,7 @@ class Notifier:
                 await asyncio.sleep(e.retry_after + 1)
                 try:
                     await self.bot.send_message(
-                        tg_id, text, parse_mode="Markdown", reply_markup=keyboard
+                        tg_id, text, parse_mode=parse_mode, reply_markup=keyboard
                     )
                     return True
                 except Exception as e2:  # noqa: BLE001
@@ -236,18 +252,67 @@ class Notifier:
         loc_id: int,
         event_epoch: int,
         text: str,
+        location_name: str,
     ) -> bool:
         """Send + book-keep the cooldown slot atomically wrt failure.
 
-        On success: UPDATE delivered_at -> now() (cooldown begins).
+        On success: UPDATE delivered_at -> now() (cooldown begins),
+        инкремент notify_count и проверка квоты (если исчерпана — sub
+        удаляется и шлётся пуш «подпишись заново»).
         On failure: DELETE the claim row so the next event isn't blocked.
         """
         ok = await self._send(tg_id, text, _unsub_keyboard(sub_id))
-        if ok:
-            await self._commit_delivery(sub_id, loc_id, event_epoch)
-        else:
+        if not ok:
             await self._release_slot(sub_id, loc_id, event_epoch)
-        return ok
+            return False
+        await self._commit_delivery(sub_id, loc_id, event_epoch)
+        if await self._increment_quota_and_check(sub_id):
+            await self._handle_quota_exhausted(tg_id, sub_id, loc_id, location_name)
+        return True
+
+    async def _increment_quota_and_check(self, sub_id: int) -> bool:
+        """+1 к notify_count подписки. True если квота исчерпана."""
+        async with SessionLocal() as s:
+            result = await s.execute(
+                update(Subscription)
+                .where(Subscription.id == sub_id)
+                .values(notify_count=Subscription.notify_count + 1)
+                .returning(Subscription.notify_count, Subscription.notify_limit)
+            )
+            row = result.first()
+            await s.commit()
+        if row is None:
+            return False
+        # row — Row[(notify_count, notify_limit)]
+        count, limit = row[0], row[1]
+        return limit is not None and count >= limit
+
+    async def _handle_quota_exhausted(
+        self, tg_id: int, sub_id: int, loc_id: int, location_name: str
+    ) -> None:
+        """Удаляем подписку и шлём пуш «лимит исчерпан, [Подписаться снова]»."""
+        async with SessionLocal() as s:
+            await s.execute(delete(Subscription).where(Subscription.id == sub_id))
+            await s.commit()
+        text = (
+            f"📭 Лимит уведомлений по «{location_name}» исчерпан — "
+            f"подписка снята.\nХочешь продолжить — оформи заново."
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Подписаться снова",
+                        callback_data=f"sub:{loc_id}",
+                    )
+                ]
+            ]
+        )
+        # parse_mode=None — в имени локации могут быть символы, ломающие
+        # Markdown (звёздочки, подчёркивания), а exhausted-пуш категорически
+        # не должен теряться: это финальный аккорд подписки.
+        await self._send(tg_id, text, kb, parse_mode=None)
+        log.info("quota_exhausted_notified", user=tg_id, sub=sub_id, loc=loc_id)
 
     # -------- event dispatch --------
 
@@ -278,10 +343,28 @@ class Notifier:
         now = datetime.now(timezone.utc)
         event_epoch = int(event["ts"])
         text = _format_alert(event)
+        location_name = str(event.get("name", "локация"))
+
+        # Какие именно типы коннекторов сейчас свободны на станции.
+        # Заполняется poller-ом на transition AVAILABLE; пустой список = poller
+        # не смог получить detail. В этом случае фильтр по connector_type
+        # отключаем (shoot-the-moon: лучше false-positive пуш чем silent loss).
+        raw_free = event.get("free_connector_types") or []
+        free_types_set: set[str] = (
+            set(raw_free) if isinstance(raw_free, list) else set()
+        )
 
         paid_ready: list[tuple[int, int]] = []  # (tg_id, sub_id)
         free_ready: list[tuple[int, int]] = []
         for sub, user in subs:
+            # Фильтр по типу коннектора — только если sub его задал И poller
+            # знает что там сейчас свободно.
+            if (
+                sub.connector_type is not None
+                and free_types_set
+                and sub.connector_type not in free_types_set
+            ):
+                continue
             # auto-downgrade expired paid tier
             tier = user.tier
             if tier == Tier.PAID.value and user.paid_until and user.paid_until < now:
@@ -295,7 +378,9 @@ class Notifier:
 
         # paid → send now (commit cooldown only on success)
         for tg_id, sub_id in paid_ready:
-            await self._send_with_slot(tg_id, sub_id, loc_id, event_epoch, text)
+            await self._send_with_slot(
+                tg_id, sub_id, loc_id, event_epoch, text, location_name
+            )
 
         # free → schedule via Redis ZSET; the slot stays "claimed" until the
         # delayed_worker either delivers (commit) or cancels/fails (release).
@@ -305,6 +390,7 @@ class Notifier:
                 "tg_ids_subs": free_ready,
                 "text": text,
                 "location_id": loc_id,
+                "location_name": location_name,
                 "event_epoch": event_epoch,
             }
             await self.redis.zadd(
@@ -348,9 +434,10 @@ class Notifier:
                     continue
 
                 text = payload["text"]
+                location_name = payload.get("location_name") or "локация"
                 for tg_id, sub_id in payload["tg_ids_subs"]:
                     await self._send_with_slot(
-                        tg_id, sub_id, loc_id, event_epoch, text
+                        tg_id, sub_id, loc_id, event_epoch, text, location_name
                     )
 
             try:
