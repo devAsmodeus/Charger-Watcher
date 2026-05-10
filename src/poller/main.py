@@ -16,7 +16,7 @@ from api.client import (
     SUPPORTED_OPERATORS_MVP,
     ProviderClient,
 )
-from api.models import LocationStatus, LocationSummary, Operator
+from api.models import LocationDetail, LocationStatus, LocationSummary, Operator
 from config import get_settings
 from db.models import Location, Subscription
 from db.session import SessionLocal
@@ -31,6 +31,24 @@ EVENTS_STREAM = "charger:events"
 # that happened during downtime is silently lost — a missed notification.
 REST_PREV_HASH = "poller:rest:prev"  # field "<operator>:<external_id>" -> status
 SSE_FREE_HASH = "poller:sse:last_any_free"  # field "<device_number>" -> "1" / "0"
+
+# Catalog of connector types per location (статика — типы железа). Bot
+# читает этот hash в wizard'е подписки чтобы построить keyboard выбора.
+# Field = "<location_id>", value = JSON list[str] (typeRu/typeEn).
+LOCATION_CONNECTORS_HASH = "location_connectors"
+
+
+def _all_connector_types(detail: LocationDetail) -> list[str]:
+    """Уникальные человеко-читаемые типы коннекторов на локации."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in detail.devices:
+        for c in d.connectors:
+            label = c.typeRu or c.typeEn
+            if label and label not in seen:
+                seen.add(label)
+                out.append(label)
+    return out
 
 
 # ---------- location catalog ----------
@@ -156,6 +174,28 @@ async def save_rest_prev(
         await pipe.execute()
 
 
+async def _free_types_on_transition(
+    client: ProviderClient, op: Operator, external_id: str
+) -> list[str]:
+    """Дёрнуть detail и вернуть человеко-читаемые типы свободных коннекторов.
+
+    Вызывается ТОЛЬКО на transition AVAILABLE — не на каждом поллинге, а
+    только при detection факта освобождения. Стоимость ~один HTTP-вызов
+    на transition; при типичных нагрузках это десятки/час, не тысячи.
+    """
+    try:
+        detail = await client.get_location_detail(op, external_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "rest_detail_failed_on_transition",
+            op=op.value,
+            ext=external_id,
+            err=str(e),
+        )
+        return []
+    return detail.free_connector_types()
+
+
 async def rest_diff_once(
     client: ProviderClient,
     redis: aioredis.Redis,
@@ -186,6 +226,14 @@ async def rest_diff_once(
             location_id = ext_to_id.get(item.id)
             if location_id is None:
                 continue
+
+            # Transition AVAILABLE — выясняем какие именно типы коннекторов
+            # сейчас свободны, чтобы notifier мог отфильтровать подписки
+            # по connector_type. Для FULLY_USED/UNAVAILABLE список не нужен.
+            free_types: list[str] = []
+            if item.status is LocationStatus.AVAILABLE:
+                free_types = await _free_types_on_transition(client, op, item.id)
+
             await publish_event(
                 redis,
                 {
@@ -196,6 +244,7 @@ async def rest_diff_once(
                     "from_status": old.value,
                     "to_status": item.status.value,
                     "became_available": item.status is LocationStatus.AVAILABLE,
+                    "free_connector_types": free_types,
                     "name": item.name,
                     "address": item.address,
                     "lat": item.latitude,
@@ -219,21 +268,36 @@ async def rest_diff_once(
 
 # ---------- SSE manager for Network A ----------
 
-async def _get_central_device_numbers(
+async def _get_central_device_info(
     client: ProviderClient, external_id: str
-) -> list[int]:
-    """One-off call to discover device.number list for a Network A location."""
+) -> dict[int, dict[int, str]]:
+    """Discover devices on a Network A location and their connector maps.
+
+    Returns: device_number -> {codeByProtocol -> human-readable typeRu/typeEn}.
+    SSE-фрейм даёт только ``codeByProtocol``; чтобы в payload event'а класть
+    нормальные русские названия типов коннекторов (для фильтра подписок),
+    нам нужен этот map. Получаем его одним detail-вызовом на старте
+    SSE worker'а.
+    """
     try:
         detail = await client.get_location_detail(Operator.MAIN, external_id)
     except Exception as e:
         log.warning("central_detail_failed", ext=external_id, err=str(e))
-        return []
-    out: list[int] = []
+        return {}
+    out: dict[int, dict[int, str]] = {}
     for d in detail.devices:
         try:
-            out.append(int(d.number))  # type: ignore[arg-type]
+            dn = int(d.number)  # type: ignore[arg-type]
         except Exception:
             continue
+        cmap: dict[int, str] = {}
+        for c in d.connectors:
+            if c.codeByProtocol is None:
+                continue
+            label = c.typeRu or c.typeEn
+            if label:
+                cmap[c.codeByProtocol] = label
+        out[dn] = cmap
     return out
 
 
@@ -247,11 +311,16 @@ async def _sse_worker(
     address: str,
     lat: float,
     lon: float,
+    connector_map: dict[int, str],
 ) -> None:
     """Long-lived task: consume SSE, detect 'any connector Available' transitions.
 
     The remote emits a heartbeat every ~2s with the current state of every
     connector on this device — we diff locally.
+
+    ``connector_map`` (codeByProtocol -> typeRu) used to populate
+    ``free_connector_types`` in the published event so notifier can filter
+    by user's connector preference.
     """
     log.info("sse_open", device=device_number, ext=external_id)
     # per-connector last seen OCPP status
@@ -298,6 +367,15 @@ async def _sse_worker(
                 if any_free:
                     # location transitioned to having at least one free connector
                     now = int(time.time())
+                    free_types: list[str] = []
+                    seen_types: set[str] = set()
+                    for c, st in last.items():
+                        if st not in FREE_OCPP_STATUSES:
+                            continue
+                        label = connector_map.get(c)
+                        if label and label not in seen_types:
+                            seen_types.add(label)
+                            free_types.append(label)
                     await publish_event(
                         redis,
                         {
@@ -308,6 +386,7 @@ async def _sse_worker(
                             "from_status": "FULLY_USED",
                             "to_status": "AVAILABLE",
                             "became_available": True,
+                            "free_connector_types": free_types,
                             "name": name,
                             "address": address,
                             "lat": lat,
@@ -361,24 +440,28 @@ class SseManager:
     def __init__(self, client: ProviderClient, redis: aioredis.Redis) -> None:
         self._client = client
         self._redis = redis
-        # device_number -> (task, location_id)
+        # device_number -> SSE worker task
         self._workers: dict[int, asyncio.Task[None]] = {}
-        # location_id -> list[device_number]  (cache so we don't re-query detail)
-        self._loc_devices: dict[int, list[int]] = {}
+        # location_id -> {device_number -> {codeByProtocol -> typeRu}}
+        # Кэш статичных метаданных устройства/коннекторов: получаем один раз
+        # detail-вызовом, переиспользуем во всех последующих ticks.
+        self._loc_devices: dict[int, dict[int, dict[int, str]]] = {}
 
     async def tick(self) -> None:
         locs = await _subscribed_central_locations()
-        wanted: dict[int, Location] = {}  # device_number -> Location row
+        # device_number -> (Location row, connector_map)
+        wanted: dict[int, tuple[Location, dict[int, str]]] = {}
 
         for loc in locs:
             if loc.id not in self._loc_devices:
-                devs = await _get_central_device_numbers(self._client, loc.external_id)
-                self._loc_devices[loc.id] = devs
-            for dn in self._loc_devices[loc.id]:
-                wanted[dn] = loc
+                self._loc_devices[loc.id] = await _get_central_device_info(
+                    self._client, loc.external_id
+                )
+            for dn, cmap in self._loc_devices[loc.id].items():
+                wanted[dn] = (loc, cmap)
 
         # open new workers
-        for dn, loc in wanted.items():
+        for dn, (loc, cmap) in wanted.items():
             if dn in self._workers and not self._workers[dn].done():
                 continue
             task = asyncio.create_task(
@@ -392,6 +475,7 @@ class SseManager:
                     loc.address,
                     loc.latitude,
                     loc.longitude,
+                    cmap,
                 ),
                 name=f"sse:{dn}",
             )
@@ -411,6 +495,56 @@ class SseManager:
             t.cancel()
         await asyncio.gather(*self._workers.values(), return_exceptions=True)
         self._workers.clear()
+
+
+# ---------- connectors catalog (для wizard'а bot-а) ----------
+
+async def connectors_catalog_tick(
+    client: ProviderClient, redis: aioredis.Redis
+) -> None:
+    """Раз в N часов обходим все известные локации и сохраняем в Redis
+    список их типов коннекторов. Bot читает этот кэш в wizard'е подписки.
+
+    Стоимость: ~1 detail-вызов на локацию × N локаций. Под пару тысяч
+    локаций и pacing 0.1с между запросами — около 3-4 минут на проход,
+    лежит на грани приемлемой нагрузки на upstream API. Если каталог
+    вырастет, поднять ``connectors_sync_interval_sec`` или добавить
+    bulk-эндпоинт.
+    """
+    async with SessionLocal() as s:
+        rows = (await s.execute(select(Location))).scalars().all()
+    if not rows:
+        return
+    written = 0
+    pipe = redis.pipeline()
+    for loc in rows:
+        try:
+            op = Operator(loc.operator)
+        except ValueError:
+            continue
+        try:
+            detail = await client.get_location_detail(op, loc.external_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "connectors_detail_failed",
+                op=loc.operator,
+                ext=loc.external_id,
+                err=str(e),
+            )
+            continue
+        types = _all_connector_types(detail)
+        if types:
+            await pipe.hset(
+                LOCATION_CONNECTORS_HASH,
+                str(loc.id),
+                orjson.dumps(types).decode(),
+            )
+            written += 1
+        # Gentle pacing: provider — public API, не злоупотребляем.
+        await asyncio.sleep(0.1)
+    if written:
+        await pipe.execute()
+    log.info("connectors_catalog_synced", written=written, total=len(rows))
 
 
 # ---------- runner ----------
@@ -477,13 +611,21 @@ async def _runner() -> None:
         async def sse_tick() -> None:
             await sse_mgr.tick()
 
-        # prime catalog once at start
+        async def connectors_tick() -> None:
+            await connectors_catalog_tick(client, redis)
+
+        # prime catalog once at start (including connectors so wizard works
+        # immediately on boot, не ждёт первого 6-часового тика).
         await catalog_tick()
+        await connectors_tick()
 
         tasks = [
             asyncio.create_task(_periodic(stop, settings.poll_interval_sec, rest_tick)),
             asyncio.create_task(_periodic(stop, settings.catalog_sync_interval_sec, catalog_tick)),
             asyncio.create_task(_periodic(stop, settings.sse_sync_interval_sec, sse_tick)),
+            asyncio.create_task(
+                _periodic(stop, settings.connectors_sync_interval_sec, connectors_tick)
+            ),
         ]
         await stop.wait()
         for t in tasks:

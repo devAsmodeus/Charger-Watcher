@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     poll_interval_sec: int = Field(default=10, alias="POLL_INTERVAL_SEC")
     catalog_sync_interval_sec: int = Field(default=300, alias="CATALOG_SYNC_INTERVAL_SEC")
     sse_sync_interval_sec: int = Field(default=15, alias="SSE_SYNC_INTERVAL_SEC")
+    # Раз в N сек poller обходит весь каталог и обновляет Redis-кэш
+    # location_connectors:<id> — статичные типы коннекторов на каждой
+    # станции. Bot читает этот кэш в wizard'е подписки. Типы меняются
+    # редко (физическое железо), 6 ч — с запасом.
+    connectors_sync_interval_sec: int = Field(
+        default=21_600, alias="CONNECTORS_SYNC_INTERVAL_SEC"
+    )
     http_timeout_sec: int = Field(default=15, alias="HTTP_TIMEOUT_SEC")
     http_proxy_url: str | None = Field(default=None, alias="HTTP_PROXY_URL")
 
