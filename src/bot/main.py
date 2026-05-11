@@ -251,7 +251,7 @@ async def cmd_privacy(message: Message) -> None:
         "• Список ваших подписок (id локации)\n"
         "• Лог отправленных уведомлений (для дедупа)\n\n"
         "Данные не передаются третьим лицам и используются только для рассылки уведомлений. "
-        "Удалить все свои данные можно командой /delete_me — действие необратимо.\n\n"
+        "Удалить все свои данные можно командой /delete\\_me — действие необратимо.\n\n"
         "Сервис не является официальным от оператора зарядных станций. "
         "Вопросы и жалобы — через /start → контакты автора.",
         parse_mode="Markdown",
@@ -262,9 +262,36 @@ async def cmd_privacy(message: Message) -> None:
 async def cmd_delete_me(message: Message) -> None:
     if message.from_user is None:
         return
-    tg_id = message.from_user.id
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Да, удалить навсегда", callback_data="delme:y")],
+            [InlineKeyboardButton(text="Отмена", callback_data="delme:n")],
+        ]
+    )
+    await message.answer(
+        "⚠️ Удалить все данные?\n\n"
+        "• все подписки слетят\n"
+        "• если у тебя сейчас paid — статус сгорит, оплату не вернуть\n"
+        "• ещё не доставленные уведомления не придут\n\n"
+        "Действие необратимо.",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("delme:"))
+async def on_delme_callback(cb: CallbackQuery) -> None:
+    if cb.from_user is None or cb.data is None or cb.message is None:
+        return
+    action = cb.data.split(":", 1)[1]
+    if action == "n":
+        await cb.answer("Отменено")
+        await cb.message.edit_text("Удаление отменено. Подписки на месте.")
+        return
+    if action != "y":
+        await cb.answer()
+        return
+    tg_id = cb.from_user.id
     async with SessionLocal() as s:
-        # FK cascades will handle subs + notif log
         await s.execute(delete(NotificationLog).where(
             NotificationLog.subscription_id.in_(
                 select(Subscription.id).where(Subscription.user_tg_id == tg_id)
@@ -273,7 +300,8 @@ async def cmd_delete_me(message: Message) -> None:
         await s.execute(delete(Subscription).where(Subscription.user_tg_id == tg_id))
         await s.execute(delete(User).where(User.tg_id == tg_id))
         await s.commit()
-    await message.answer("Все данные удалены. /start — начать заново.")
+    await cb.answer("Удалено")
+    await cb.message.edit_text("Все данные удалены. /start — начать заново.")
 
 
 async def _send_nearby_prompt(message: Message) -> None:
@@ -751,6 +779,9 @@ async def _runner() -> None:
     if not settings.tg_bot_token:
         raise RuntimeError("TG_BOT_TOKEN is not set")
     bot = Bot(settings.tg_bot_token)
+    # Зачищаем устаревший /-menu от прошлых деплоев. UX живёт на inline-кнопках
+    # /start, отдельный slash-список только путает.
+    await bot.set_my_commands([])
     redis = aioredis.from_url(settings.redis_url, decode_responses=True)
     global _redis_instance
     _redis_instance = redis
