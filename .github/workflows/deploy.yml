@@ -1,0 +1,58 @@
+name: Deploy
+
+# Триггерится на published-релиз (release-please создаёт релиз после мержа
+# своего PR), либо вручную через workflow_dispatch с указанием тега/ветки.
+#
+# Сервер: 178.72.178.9, /srv/charger-watcher. Под капотом git checkout --detach
+# на тег — обходит ситуацию, когда server-local main диверджит от origin/main
+# (исторически на проде коммитили напрямую).
+#
+# Требуемые secrets:
+#   DEPLOY_HOST     — 178.72.178.9
+#   DEPLOY_USER     — pavel
+#   DEPLOY_SSH_KEY  — приватный ключ (отдельный deploy-key, не личный id_ed25519)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag, branch, or SHA to deploy (e.g. v0.2.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: 22
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            REF="${{ github.event.release.tag_name || inputs.ref }}"
+            echo ">>> deploying ref: $REF"
+            cd /srv/charger-watcher
+            git fetch --tags --prune --force origin
+            git checkout --detach "$REF"
+            docker compose run --rm poller alembic upgrade head
+            docker compose up -d --build
+            sleep 5
+            docker compose ps
+            echo ">>> recent bot logs:"
+            docker compose logs --tail=20 bot
+            echo ">>> recent poller logs:"
+            docker compose logs --tail=20 poller

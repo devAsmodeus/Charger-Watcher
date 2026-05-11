@@ -1,9 +1,9 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
 import time
-from collections.abc import Iterable
 
 import orjson
 import redis.asyncio as aioredis
@@ -559,10 +559,8 @@ async def _periodic(stop: asyncio.Event, interval: float, fn) -> None:
             log.exception("periodic_failed", err=str(e))
         dt = time.perf_counter() - t0
         sleep_for = max(0.0, interval - dt)
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=sleep_for)
-        except TimeoutError:
-            pass
 
 
 async def _runner() -> None:
@@ -581,10 +579,8 @@ async def _runner() -> None:
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+        with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _handle_sig)
-        except NotImplementedError:
-            pass
 
     redis = aioredis.from_url(settings.redis_url, decode_responses=True)
 

@@ -4,7 +4,6 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import get_settings
 
-
 GREETING_NEW = (
     "👋 Я слежу за свободными ЭЗС в Беларуси "
     "(сети Маланка, Evika, Battery-fly).\n"

@@ -18,13 +18,14 @@ installed locally — install with ``pip install fakeredis``.
 from __future__ import annotations
 
 import importlib.util
-from typing import Any
 
 import pytest
 
 fakeredis_spec = importlib.util.find_spec("fakeredis")
 if fakeredis_spec is None:  # pragma: no cover
     pytest.skip("fakeredis not installed", allow_module_level=True)
+
+import contextlib
 
 import fakeredis.aioredis as fr
 
@@ -40,10 +41,8 @@ async def test_consumer_group_replays_pre_restart_messages() -> None:
         await r.xadd(EVENTS_STREAM, {"data": '{"ts":1,"location_id":1}'})
 
         # Consumer side: create group at id=0 (mkstream guards against race).
-        try:
+        with contextlib.suppress(Exception):
             await r.xgroup_create(EVENTS_STREAM, NOTIFIER_GROUP, id="0", mkstream=True)
-        except Exception:
-            pass
 
         resp = await r.xreadgroup(
             NOTIFIER_GROUP, NOTIFIER_CONSUMER, {EVENTS_STREAM: ">"}, count=10

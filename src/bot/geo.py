@@ -2,11 +2,14 @@
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import Location
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 
 def _deg_per_km(lat: float) -> tuple[float, float]:
