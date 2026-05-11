@@ -42,6 +42,11 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "SIM", "TCH"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+# E402 — module-import-not-at-top: тесты используют pytest.importorskip
+# для опциональных зависимостей (fakeredis) до основных импортов.
+"tests/*" = ["E402"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

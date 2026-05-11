@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 import httpx
 import orjson
@@ -13,6 +12,9 @@ from api.models import (
     LocationSummary,
     Operator,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 log = structlog.get_logger(__name__)
 

@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import html
 import signal
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import orjson
 import redis.asyncio as aioredis
@@ -120,7 +120,7 @@ def _effective_tier(user: User) -> str:
     if (
         user.tier == Tier.PAID.value
         and user.paid_until
-        and user.paid_until < datetime.now(timezone.utc)
+        and user.paid_until < datetime.now(UTC)
     ):
         return Tier.FREE.value
     return user.tier
@@ -687,7 +687,7 @@ async def on_paid(message: Message) -> None:
     except (ValueError, IndexError):
         days = get_settings().paid_tier_duration_days
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with SessionLocal() as s:
         # Сначала фиксируем платёжку — без telegram_payment_charge_id
         # refund физически невозможен (Refund Policy §3 → refundStarsCharge).
@@ -762,10 +762,8 @@ async def _runner() -> None:
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+        with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _sig)
-        except NotImplementedError:
-            pass
 
     notifier = Notifier(bot, redis)
     bg_tasks = [

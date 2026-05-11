@@ -41,13 +41,14 @@ Reliability invariants
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import orjson
 import redis.asyncio as aioredis
 import structlog
-from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiolimiter import AsyncLimiter
@@ -56,13 +57,15 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import get_settings
 from db.models import (
-    Location,
     NotificationLog,
     Subscription,
     Tier,
     User,
 )
 from db.session import SessionLocal
+
+if TYPE_CHECKING:
+    from aiogram import Bot
 
 log = structlog.get_logger(__name__)
 
@@ -166,7 +169,7 @@ class Notifier:
         failed send (followed by ``release_slot``) does not poison subsequent
         legitimate retries.
         """
-        cutoff = datetime.now(timezone.utc) - timedelta(
+        cutoff = datetime.now(UTC) - timedelta(
             seconds=self.settings.notify_cooldown_sec
         )
         async with SessionLocal() as s:
@@ -218,7 +221,7 @@ class Notifier:
                         NotificationLog.event_epoch == event_epoch,
                     )
                 )
-                .values(delivered_at=datetime.now(timezone.utc))
+                .values(delivered_at=datetime.now(UTC))
             )
             await s.commit()
 
@@ -340,7 +343,7 @@ class Notifier:
         if not subs:
             return
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         event_epoch = int(event["ts"])
         text = _format_alert(event)
         location_name = str(event.get("name", "локация"))
@@ -401,7 +404,7 @@ class Notifier:
 
     async def delayed_worker(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
-            now = int(datetime.now(timezone.utc).timestamp())
+            now = int(datetime.now(UTC).timestamp())
             due = await self.redis.zrangebyscore(DELAYED_ZSET, 0, now, start=0, num=100)
             for raw in due:
                 # atomic "take": remove then process. If already taken by
@@ -440,10 +443,8 @@ class Notifier:
                         tg_id, sub_id, loc_id, event_epoch, text, location_name
                     )
 
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=5.0)
-            except TimeoutError:
-                pass
 
     # -------- main loop --------
 
@@ -542,7 +543,7 @@ async def tier_reaper(stop: asyncio.Event) -> None:
     """
     settings = get_settings()
     while not stop.is_set():
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with SessionLocal() as s:
             rows = (
                 await s.execute(
@@ -560,7 +561,5 @@ async def tier_reaper(stop: asyncio.Event) -> None:
             if rows:
                 await s.commit()
                 log.info("tier_reaper_downgraded", count=len(rows))
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=settings.tier_reaper_interval_sec)
-        except TimeoutError:
-            pass
