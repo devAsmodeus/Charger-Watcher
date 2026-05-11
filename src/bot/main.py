@@ -2,9 +2,11 @@
 
 import asyncio
 import contextlib
+import html
 import signal
 from datetime import datetime, timedelta, timezone
 
+import orjson
 import redis.asyncio as aioredis
 import structlog
 from aiogram import Bot, Dispatcher, F
@@ -22,6 +24,7 @@ from aiogram.types import (
 )
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 
 from bot.geo import find_nearby
 from bot.notifier import Notifier, tier_reaper
@@ -35,6 +38,7 @@ from config import get_settings
 from db.models import (
     Location,
     NotificationLog,
+    Payment,
     Subscription,
     SubscriptionMode,
     Tier,
@@ -45,6 +49,36 @@ from logging_setup import setup_logging
 
 log = structlog.get_logger(__name__)
 dp = Dispatcher()
+
+# Пауза между карточками локаций в /find и /nearby. Telegram гасит
+# бёрсты быстрее ~5 msg/s в один чат — десяток подряд почти всегда
+# словит FloodWait и сообщения уйдут с задержкой / не уйдут вовсе.
+LIST_THROTTLE_SEC = 0.35
+
+# Sync с poller-ом: hash, заполняемый periodic-таской connectors_catalog_tick.
+LOCATION_CONNECTORS_HASH = "location_connectors"
+
+# Опции лимита уведомлений в wizard'е. 0 — кодирует "∞" в callback_data
+# (NULL в БД). Telegram callback_data ограничен 64 байтами, длинные
+# строки сюда не помещаются.
+LIMIT_OPTIONS: list[tuple[str, int]] = [
+    ("1 уведомление", 1),
+    ("2 уведомления", 2),
+    ("3 уведомления", 3),
+    ("5 уведомлений", 5),
+    ("10 уведомлений", 10),
+    ("∞ всегда", 0),
+]
+
+# Глобальный handle на Redis — handlers не получают его параметром, а
+# DI-middleware aiogram'а здесь избыточен. Инициализируется в _runner.
+_redis_instance: aioredis.Redis | None = None
+
+
+def _redis() -> aioredis.Redis:
+    if _redis_instance is None:
+        raise RuntimeError("Redis is not initialized — _runner did not start")
+    return _redis_instance
 
 
 # ---------- helpers ----------
@@ -115,6 +149,86 @@ def _subscribe_kb(location_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔔 Подписаться", callback_data=f"sub:{location_id}")]
         ]
     )
+
+
+# ---------- subscribe wizard helpers ----------
+
+# Cap на число типов коннекторов в keyboard'е — реалистичный потолок
+# на станции = 3-4, девятку оставляем как защиту от мусорных данных.
+_CONNECTOR_KB_CAP = 9
+
+
+async def _connector_types_for(location_id: int) -> list[str]:
+    """Читает Redis-кэш, наполняемый poller-ом (connectors_catalog_tick).
+
+    Пустой результат = poller ещё не успел синхронизировать (boot) или
+    upstream API не отдаёт detail для этой станции — wizard fallback'ит
+    на «любой коннектор» одной кнопкой.
+    """
+    raw = await _redis().hget(LOCATION_CONNECTORS_HASH, str(location_id))
+    if not raw:
+        return []
+    try:
+        types = orjson.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(types, list):
+        return []
+    return [t for t in types if isinstance(t, str)][:_CONNECTOR_KB_CAP]
+
+
+def _connector_kb(location_id: int, types: list[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, t in enumerate(types):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🔌 {t}", callback_data=f"wcon:{location_id}:{i}"
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔌 Любой коннектор", callback_data=f"wcon:{location_id}:a"
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _limit_kb(location_id: int, con_token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"wlim:{location_id}:{con_token}:{n}",
+                )
+            ]
+            for label, n in LIMIT_OPTIONS
+        ]
+    )
+
+
+async def _resolve_connector_token(
+    location_id: int, con_token: str
+) -> str | None | bool:
+    """Возвращает выбранный тип коннектора или None для «любой».
+
+    False — токен невалиден (idx за пределами текущего кэша); вызывающий
+    отвечает юзеру и выходит.
+    """
+    if con_token == "a":
+        return None
+    try:
+        idx = int(con_token)
+    except ValueError:
+        return False
+    types = await _connector_types_for(location_id)
+    if idx < 0 or idx >= len(types):
+        return False
+    return types[idx]
 
 
 # ---------- handlers ----------
@@ -191,14 +305,18 @@ async def on_location(message: Message) -> None:
     await message.answer(
         f"Нашёл {len(hits)} станций в радиусе 5 км:", reply_markup=ReplyKeyboardRemove()
     )
-    for h in hits:
+    for i, h in enumerate(hits):
         loc = h.location
         text = (
-            f"{_status_icon(loc.last_status)} *{loc.name}*\n"
-            f"{loc.address}\n"
-            f"📏 {h.distance_km:.2f} км · сеть: {loc.operator}"
+            f"{_status_icon(loc.last_status)} <b>{html.escape(loc.name)}</b>\n"
+            f"{html.escape(loc.address)}\n"
+            f"📏 {h.distance_km:.2f} км · сеть: {html.escape(loc.operator)}"
         )
-        await message.answer(text, parse_mode="Markdown", reply_markup=_subscribe_kb(loc.id))
+        await message.answer(text, parse_mode="HTML", reply_markup=_subscribe_kb(loc.id))
+        # Telegram per-chat бёрстит ~5 msg/s до FloodWait. 10 карточек подряд
+        # уверенно его триггерят — раздаём с интервалом, кроме последней.
+        if i < len(hits) - 1:
+            await asyncio.sleep(LIST_THROTTLE_SEC)
 
 
 @dp.message(Command("find"))
@@ -220,13 +338,15 @@ async def cmd_find(message: Message, command: CommandObject) -> None:
     if not rows:
         await message.answer("Ничего не нашёл. Попробуй другой запрос.")
         return
-    for loc in rows:
+    for i, loc in enumerate(rows):
         text = (
-            f"{_status_icon(loc.last_status)} *{loc.name}*\n"
-            f"{loc.address}\n"
-            f"сеть: {loc.operator}"
+            f"{_status_icon(loc.last_status)} <b>{html.escape(loc.name)}</b>\n"
+            f"{html.escape(loc.address)}\n"
+            f"сеть: {html.escape(loc.operator)}"
         )
-        await message.answer(text, parse_mode="Markdown", reply_markup=_subscribe_kb(loc.id))
+        await message.answer(text, parse_mode="HTML", reply_markup=_subscribe_kb(loc.id))
+        if i < len(rows) - 1:
+            await asyncio.sleep(LIST_THROTTLE_SEC)
 
 
 async def _send_list(message: Message, tg_id: int) -> None:
@@ -268,7 +388,13 @@ async def cmd_list(message: Message) -> None:
 
 @dp.callback_query(F.data.startswith("sub:"))
 async def on_sub_callback(cb: CallbackQuery) -> None:
-    if cb.from_user is None or cb.data is None:
+    """Wizard step 1: показать клавиатуру выбора типа коннектора.
+
+    Состояние wizard'а целиком закодировано в callback_data следующих
+    кнопок (location_id + connector idx + лимит) — отдельный Redis-state
+    не нужен, переживает рестарт бота.
+    """
+    if cb.from_user is None or cb.data is None or cb.message is None:
         return
     try:
         location_id = int(cb.data.split(":", 1)[1])
@@ -286,28 +412,112 @@ async def on_sub_callback(cb: CallbackQuery) -> None:
         return
     async with SessionLocal() as s:
         loc = await s.get(Location, location_id)
+    if loc is None:
+        await cb.answer("Локация не найдена")
+        return
+    types = await _connector_types_for(location_id)
+    await cb.answer()
+    if not types:
+        # Кэш ещё не наполнился poller-ом или станция без detail —
+        # сразу к шагу лимита, тип = «любой».
+        await cb.message.answer(
+            f"Подписка на: {loc.name}\nКоннектор: любой.\nСколько уведомлений хочешь?",
+            reply_markup=_limit_kb(location_id, "a"),
+        )
+        return
+    await cb.message.answer(
+        f"Подписка на: {loc.name}\nВыбери тип коннектора:",
+        reply_markup=_connector_kb(location_id, types),
+    )
+
+
+@dp.callback_query(F.data.startswith("wcon:"))
+async def on_wcon_callback(cb: CallbackQuery) -> None:
+    """Wizard step 2: после выбора коннектора — keyboard выбора лимита."""
+    if cb.from_user is None or cb.data is None or cb.message is None:
+        return
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        await cb.answer("Плохой id")
+        return
+    try:
+        location_id = int(parts[1])
+    except ValueError:
+        await cb.answer("Плохой id")
+        return
+    con_token = parts[2]
+    resolved = await _resolve_connector_token(location_id, con_token)
+    if resolved is False:
+        await cb.answer("Тип коннектора недоступен — попробуй ещё раз.")
+        return
+    type_str = resolved if isinstance(resolved, str) else "любой"
+    await cb.answer()
+    await cb.message.edit_text(
+        f"Коннектор: {type_str}.\nСколько уведомлений хочешь?",
+        reply_markup=_limit_kb(location_id, con_token),
+    )
+
+
+@dp.callback_query(F.data.startswith("wlim:"))
+async def on_wlim_callback(cb: CallbackQuery) -> None:
+    """Wizard step 3: создаём подписку с выбранным connector_type/notify_limit."""
+    if cb.from_user is None or cb.data is None or cb.message is None:
+        return
+    parts = cb.data.split(":")
+    if len(parts) != 4:
+        await cb.answer("Плохой id")
+        return
+    try:
+        location_id = int(parts[1])
+        n = int(parts[3])
+    except ValueError:
+        await cb.answer("Плохой id")
+        return
+    con_token = parts[2]
+    resolved = await _resolve_connector_token(location_id, con_token)
+    if resolved is False:
+        await cb.answer("Тип коннектора недоступен — попробуй ещё раз.")
+        return
+    connector_type: str | None = resolved if isinstance(resolved, str) else None
+    notify_limit: int | None = None if n == 0 else n
+
+    user = await ensure_user(cb.from_user.id)
+    # Re-check tier limit — между шагами 1 и 3 юзер мог подписаться
+    # с другого устройства.
+    tier = _effective_tier(user)
+    count = await user_subscription_count(user.tg_id)
+    if count >= tier_limit(tier):
+        await cb.answer(
+            f"Лимит подписок ({tier_limit(tier)}). Сними одну в /list или /upgrade.",
+            show_alert=True,
+        )
+        return
+    async with SessionLocal() as s:
+        loc = await s.get(Location, location_id)
         if loc is None:
             await cb.answer("Локация не найдена")
-            return
-        existing = (
-            await s.execute(
-                select(Subscription).where(
-                    Subscription.user_tg_id == user.tg_id,
-                    Subscription.location_id == location_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if existing is not None:
-            await cb.answer("Уже подписан на эту локацию.")
             return
         sub = Subscription(
             user_tg_id=user.tg_id,
             mode=SubscriptionMode.LOCATION.value,
             location_id=location_id,
+            connector_type=connector_type,
+            notify_limit=notify_limit,
         )
         s.add(sub)
-        await s.commit()
-    await cb.answer(f"Подписка оформлена: {loc.name}")
+        try:
+            await s.commit()
+        except IntegrityError:
+            # Двойной клик / гонка — partial unique index сработал.
+            await s.rollback()
+            await cb.answer("Уже подписан на эту локацию.")
+            return
+    limit_str = "∞ (всегда)" if notify_limit is None else f"{notify_limit} раз"
+    type_str = connector_type or "любой"
+    await cb.answer("Подписка оформлена ✔")
+    await cb.message.edit_text(
+        f"✅ Подписан: {loc.name}\nКоннектор: {type_str}\nЛимит уведомлений: {limit_str}"
+    )
 
 
 @dp.callback_query(F.data.startswith("unsub:"))
@@ -424,6 +634,45 @@ async def cmd_upgrade(message: Message) -> None:
 
 @dp.pre_checkout_query()
 async def pre_checkout(q: PreCheckoutQuery) -> None:
+    """Validate that the invoice the client is paying matches what we sent.
+
+    Telegram's pre_checkout step is the only chance to reject a tampered
+    invoice — once we answer ok=True, ``successful_payment`` arrives and
+    ``on_paid`` will hand out PAID. We check (currency, amount, payload)
+    against the canonical values from settings; any mismatch is rejected
+    with a user-visible message and logged for audit.
+    """
+    s = get_settings()
+    expected_payload = f"paid:{s.paid_tier_duration_days}"
+    reason: str | None = None
+    if q.currency != "XTR":
+        reason = f"currency={q.currency}"
+    elif q.total_amount != s.paid_tier_price_stars:
+        reason = f"amount={q.total_amount} expected={s.paid_tier_price_stars}"
+    elif q.invoice_payload != expected_payload:
+        reason = f"payload={q.invoice_payload!r} expected={expected_payload!r}"
+
+    if reason is not None:
+        log.warning(
+            "pre_checkout_rejected",
+            user=q.from_user.id,
+            currency=q.currency,
+            amount=q.total_amount,
+            payload=q.invoice_payload,
+            reason=reason,
+        )
+        await q.answer(
+            ok=False,
+            error_message="Счёт устарел или изменён. Открой /upgrade ещё раз.",
+        )
+        return
+
+    log.info(
+        "pre_checkout_ok",
+        user=q.from_user.id,
+        amount=q.total_amount,
+        payload=q.invoice_payload,
+    )
     await q.answer(ok=True)
 
 
@@ -431,7 +680,8 @@ async def pre_checkout(q: PreCheckoutQuery) -> None:
 async def on_paid(message: Message) -> None:
     if message.from_user is None or message.successful_payment is None:
         return
-    payload = message.successful_payment.invoice_payload or ""
+    sp = message.successful_payment
+    payload = sp.invoice_payload or ""
     try:
         days = int(payload.split(":", 1)[1])
     except (ValueError, IndexError):
@@ -439,9 +689,37 @@ async def on_paid(message: Message) -> None:
 
     now = datetime.now(timezone.utc)
     async with SessionLocal() as s:
+        # Сначала фиксируем платёжку — без telegram_payment_charge_id
+        # refund физически невозможен (Refund Policy §3 → refundStarsCharge).
+        payment = Payment(
+            charge_id=sp.telegram_payment_charge_id,
+            user_tg_id=message.from_user.id,
+            amount_stars=sp.total_amount,
+            currency=sp.currency,
+            payload=payload,
+        )
+        s.add(payment)
+        try:
+            await s.flush()
+        except IntegrityError:
+            # Дубликат успешного платежа (Telegram redelivery) — user уже
+            # был апгрейжден прошлым проходом, не дописываем срок повторно.
+            await s.rollback()
+            log.warning(
+                "payment_duplicate",
+                user=message.from_user.id,
+                charge=sp.telegram_payment_charge_id,
+            )
+            await message.answer("✅ Оплата уже учтена.")
+            return
+
         user = await s.get(User, message.from_user.id)
         if user is None:
-            user = User(tg_id=message.from_user.id, tier=Tier.PAID.value, paid_until=now + timedelta(days=days))
+            user = User(
+                tg_id=message.from_user.id,
+                tier=Tier.PAID.value,
+                paid_until=now + timedelta(days=days),
+            )
             s.add(user)
         else:
             base = user.paid_until if user.paid_until and user.paid_until > now else now
@@ -451,7 +729,13 @@ async def on_paid(message: Message) -> None:
     await message.answer(
         "✅ Оплата получена. Лимит подписок увеличен, уведомления без задержки."
     )
-    log.info("payment_ok", user=message.from_user.id, days=days)
+    log.info(
+        "payment_ok",
+        user=message.from_user.id,
+        days=days,
+        charge=sp.telegram_payment_charge_id,
+        amount=sp.total_amount,
+    )
 
 
 @dp.message(F.text)
@@ -468,6 +752,8 @@ async def _runner() -> None:
         raise RuntimeError("TG_BOT_TOKEN is not set")
     bot = Bot(settings.tg_bot_token)
     redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+    global _redis_instance
+    _redis_instance = redis
 
     stop = asyncio.Event()
 

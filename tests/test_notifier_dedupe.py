@@ -79,6 +79,16 @@ def _make_notifier(monkeypatch: pytest.MonkeyPatch) -> tuple[Notifier, _SlotStat
     monkeypatch.setattr(n, "_claim_slot", _claim)
     monkeypatch.setattr(n, "_commit_delivery", _commit)
     monkeypatch.setattr(n, "_release_slot", _release)
+
+    # Quota bookkeeping touches the DB; in-memory tests stub it out.
+    async def _no_quota(_sub_id: int) -> bool:
+        return False
+
+    async def _no_handle(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(n, "_increment_quota_and_check", _no_quota)
+    monkeypatch.setattr(n, "_handle_quota_exhausted", _no_handle)
     return n, state
 
 
@@ -99,7 +109,8 @@ async def test_failed_send_does_not_consume_cooldown(monkeypatch: pytest.MonkeyP
     sub_id, loc_id, epoch1, epoch2 = 1, 100, 1_000, 2_000
 
     ok = await n._send_with_slot(tg_id=42, sub_id=sub_id, loc_id=loc_id,
-                                 event_epoch=epoch1, text="t")
+                                 event_epoch=epoch1, text="t",
+                                 location_name="loc")
     assert ok is False
     assert not state.is_delivered(sub_id, loc_id, epoch1)
     # Crucially: the row was released, so the (sub, loc) pair is open again.
@@ -123,7 +134,7 @@ async def test_successful_send_locks_in_cooldown(monkeypatch: pytest.MonkeyPatch
     sub_id, loc_id, epoch = 1, 100, 1_000
     # Claim first, then send (mirrors dispatch_event flow).
     assert await n._claim_slot(sub_id, loc_id, epoch) is True
-    ok = await n._send_with_slot(42, sub_id, loc_id, epoch, "t")
+    ok = await n._send_with_slot(42, sub_id, loc_id, epoch, "t", "loc")
     assert ok is True
     assert state.is_delivered(sub_id, loc_id, epoch)
 
