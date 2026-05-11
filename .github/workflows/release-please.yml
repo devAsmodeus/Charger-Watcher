@@ -1,0 +1,27 @@
+name: Release Please
+
+# По умолчанию release-please открывает релиз-PR от GITHUB_TOKEN. PR-ы от
+# GITHUB_TOKEN не триггерят downstream-workflows (защита GitHub Actions от
+# рекурсии). Без custom-токена релиз-PR будет висеть BLOCKED по branch
+# protection, потому что CI на нём не запустится.
+#
+# RELEASE_PLEASE_TOKEN — fine-grained PAT (contents:write, pull-requests:write
+# на этом репо). Если секрета нет, упадём на GITHUB_TOKEN — релиз-PR создастся,
+# но потребуется руками close+reopen чтобы CI запустился.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          release-type: python
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
