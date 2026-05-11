@@ -1,16 +1,16 @@
 name: Deploy
 
 # Триггерится на published-релиз (release-please создаёт релиз после мержа
-# своего PR), либо вручную через workflow_dispatch с указанием тега/ветки.
+# своего PR) или вручную через workflow_dispatch с указанием тега/ветки.
 #
-# Сервер: 178.72.178.9, /srv/charger-watcher. Под капотом git checkout --detach
-# на тег — обходит ситуацию, когда server-local main диверджит от origin/main
-# (исторически на проде коммитили напрямую).
+# Под капотом — git checkout --detach на тег: обходит ситуацию когда
+# server-local main диверджит от origin/main.
 #
-# Требуемые secrets:
-#   DEPLOY_HOST     — 178.72.178.9
-#   DEPLOY_USER     — pavel
-#   DEPLOY_SSH_KEY  — приватный ключ (отдельный deploy-key, не личный id_ed25519)
+# Требуемые repository secrets:
+#   DEPLOY_HOST     — IP/hostname прод-сервера
+#   DEPLOY_USER     — SSH-юзер
+#   DEPLOY_SSH_KEY  — приватный ключ отдельного deploy-key (НЕ личный ключ)
+# Деплой ожидает /srv/charger-watcher на удалёнке + docker compose в PATH.
 
 on:
   release:
