@@ -106,6 +106,39 @@ Charger-Watcher/
 └── pyproject.toml
 ```
 
+## CI / Релиз / Деплой
+
+От коммита до прода без ручных шагов на сервере — три GitHub Actions workflow-а:
+
+1. **CI** (`.github/workflows/ci.yml`) — на каждый PR/push в `main`: `Lint` (ruff), `Test` (pytest), `Dependency audit` (pip-audit по `pyproject.toml`). Branch protection требует зелёные чеки, иначе мерж заблокирован.
+2. **Release Please** (`.github/workflows/release-please.yml`) — на push в `main` парсит conventional-commits с момента последнего тега и открывает / обновляет PR `chore(main): release X.Y.Z` с бампом версии в `pyproject.toml` и автогенерированным `CHANGELOG.md`. После мержа этого PR создаёт git-тег `vX.Y.Z` и GitHub Release.
+3. **Deploy** (`.github/workflows/deploy.yml`) — слушает `release.published` (и `workflow_dispatch` для ручного запуска). SSH на прод-сервер → `git checkout --detach <tag>` → `alembic upgrade head` → `docker compose up -d --build`. Detached HEAD на тег обходит расхождение server-local `main` с `origin/main`.
+
+Ручной деплой любого ref-а:
+```bash
+gh workflow run deploy.yml -f ref=v0.1.0   # конкретный тег
+gh workflow run deploy.yml -f ref=main     # текущий main
+gh workflow run deploy.yml -f ref=<sha>    # коммит
+```
+
+### Conventional Commits — обязательно
+
+| Префикс | Bump | В CHANGELOG |
+|---|---|---|
+| `feat: …` | minor | Features |
+| `fix: …` | patch | Bug Fixes |
+| `feat!: …` или `BREAKING CHANGE:` в теле | major | ⚠ Breaking |
+| `chore:`, `docs:`, `refactor:`, `ci:`, `test:` | — | не попадает |
+
+Если коммит не подходит под префикс, release-please его проигнорит — для технического долга это норма, для фичи это баг (не попадёт в релиз).
+
+### Required repository secrets
+
+| Secret | Назначение |
+|---|---|
+| `RELEASE_PLEASE_TOKEN` | fine-grained PAT (`contents: write`, `pull-requests: write`). Без него релиз-PR создаётся от `GITHUB_TOKEN`, на который CI не запускается → встанет колом под branch protection |
+| `DEPLOY_HOST` / `DEPLOY_USER` / `DEPLOY_SSH_KEY` | SSH-доступ к прод-серверу. Ключ — **отдельный deploy-key**, не личный SSH-ключ |
+
 ## Roadmap
 
 - [x] MVP: Evika + Battery-fly bulk-мониторинг, подписки на локации
@@ -119,9 +152,10 @@ Charger-Watcher/
 - [x] Отписка inline-кнопкой прямо из уведомления
 - [x] `/privacy` и `/delete_me`
 - [x] SSE backoff с экспоненциальной реконнект-стратегией
-- [ ] Фильтр по типу коннектора (CCS / Type2 / CHAdeMO / ...)
+- [x] Фильтр по типу коннектора в подписке (через subscribe-wizard)
+- [x] Информативные уведомления — типы свободных коннекторов в пуше
+- [x] CI + автоматический релиз и деплой на тег
 - [ ] Адресный поиск через Nominatim (`/nearby <адрес>`)
-- [ ] Информативные уведомления (какие типы коннекторов свободны)
 - [ ] Webhook-режим бота и тесты (pytest + respx)
 
 ## Лицензия
