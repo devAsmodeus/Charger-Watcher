@@ -1,16 +1,29 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from config import get_settings
+
+# Метки reply-клавиатуры. Хэндлеры матчат по точному равенству text — поэтому
+# любая правка надписи должна синхронно поменяться в main.py.
+BTN_NEARBY = "📍 Рядом"
+BTN_FIND = "🔎 По адресу"
+BTN_LIST = "📋 Подписки"
+BTN_TIER = "💎 Тариф"
 
 GREETING_NEW = (
     "👋 Я слежу за свободными ЭЗС в Беларуси "
     "(сети Маланка, Evika, Battery-fly).\n"
-    "Подпишись на нужные локации — пришлю пуш, как только станция освободится."
+    "Подпишись на нужные локации — пришлю пуш, как только станция освободится.\n\n"
+    "Меню под полем ввода — основные действия. /about — про бота."
 )
 
-GREETING_RETURNING = "С возвращением! Чем помочь?"
+GREETING_RETURNING = "С возвращением! Меню под полем ввода."
 
 
 def about_text() -> str:
@@ -27,20 +40,41 @@ def about_text() -> str:
         f"{s.paid_tier_duration_days} дней.\n\n"
         "Данные берутся с публичных эндпоинтов операторов. Сервис не аффилирован "
         "с операторами ЭЗС.\n\n"
-        "<b>Связь с автором</b>: @AsmodeusGL · tg id <code>630675506</code>\n\n"
-        "<i>Управление — через кнопки выше.</i>"
+        "<b>Связь с автором</b>: @AsmodeusGL · tg id <code>630675506</code>"
     )
 
 
-def onboarding_kb() -> InlineKeyboardMarkup:
+def main_reply_kb() -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура под полем ввода — основная навигация.
+
+    `📍 Рядом` сразу шлёт геолокацию (request_location=True), остальные
+    кнопки — обычный текст, который ловится F.text-хэндлерами.
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=BTN_NEARBY, request_location=True),
+                KeyboardButton(text=BTN_FIND),
+            ],
+            [
+                KeyboardButton(text=BTN_LIST),
+                KeyboardButton(text=BTN_TIER),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def about_kb() -> InlineKeyboardMarkup:
     s = get_settings()
-    upgrade_label = f"💎 Расширить лимиты — {s.paid_tier_price_stars} ⭐"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Найти зарядку рядом", callback_data="onboard:nearby")],
-            [InlineKeyboardButton(text="📍 Поиск по адресу", callback_data="onboard:find")],
-            [InlineKeyboardButton(text="📋 Мои подписки", callback_data="onboard:list")],
-            [InlineKeyboardButton(text=upgrade_label, callback_data="onboard:upgrade")],
-            [InlineKeyboardButton(text="ℹ️ О боте", callback_data="onboard:about")],
+            [
+                InlineKeyboardButton(
+                    text=f"💎 Расширить лимиты — {s.paid_tier_price_stars} ⭐",
+                    callback_data="onboard:upgrade",
+                )
+            ]
         ]
     )

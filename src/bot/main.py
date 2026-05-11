@@ -12,6 +12,7 @@ import structlog
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -22,17 +23,21 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from bot.geo import find_nearby
 from bot.notifier import Notifier, tier_reaper
 from bot.onboarding import (
+    BTN_FIND,
+    BTN_LIST,
+    BTN_TIER,
     GREETING_NEW,
     GREETING_RETURNING,
+    about_kb,
     about_text,
-    onboarding_kb,
+    main_reply_kb,
 )
 from config import get_settings
 from db.models import (
@@ -239,7 +244,12 @@ async def cmd_start(message: Message) -> None:
         return
     _, is_new = await ensure_user_with_flag(message.from_user.id)
     greeting = GREETING_NEW if is_new else GREETING_RETURNING
-    await message.answer(greeting, reply_markup=onboarding_kb())
+    await message.answer(greeting, reply_markup=main_reply_kb())
+
+
+@dp.message(Command("about"))
+async def cmd_about(message: Message) -> None:
+    await message.answer(about_text(), parse_mode="HTML", reply_markup=about_kb())
 
 
 @dp.message(Command("privacy"))
@@ -569,34 +579,16 @@ async def on_unsub_callback(cb: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("onboard:"))
 async def on_onboard_callback(cb: CallbackQuery) -> None:
+    """Остался только `upgrade` — остальная навигация ушла в reply-клавиатуру.
+
+    Кнопка вызывается из inline-клавиатур в `/about` и в reply-обработчике `💎 Тариф`.
+    """
     if cb.from_user is None or cb.data is None or cb.message is None:
         return
     action = cb.data.split(":", 1)[1]
-    msg = cb.message  # the bot's greeting message; reply via .answer()
-
-    if action == "nearby":
-        await cb.answer()
-        await _send_nearby_prompt(msg)
-        return
-    if action == "find":
-        await cb.answer()
-        await msg.answer(
-            "Пришли адрес или название одним сообщением и команду /find перед ним.\n"
-            "Пример: `/find Минск Пулихова`",
-            parse_mode="Markdown",
-        )
-        return
-    if action == "list":
-        await cb.answer()
-        await _send_list(msg, cb.from_user.id)
-        return
     if action == "upgrade":
         await cb.answer()
-        await _send_upgrade_invoice(msg)
-        return
-    if action == "about":
-        await cb.answer()
-        await msg.answer(about_text(), parse_mode="HTML")
+        await _send_upgrade_invoice(cb.message)
         return
     await cb.answer("Неизвестное действие")
 
@@ -620,22 +612,33 @@ async def cmd_unsubscribe(message: Message, command: CommandObject) -> None:
     await message.answer("Подписка удалена.")
 
 
-@dp.message(Command("status"))
-async def cmd_status(message: Message) -> None:
-    if message.from_user is None:
-        return
-    user = await ensure_user(message.from_user.id)
+async def _send_tier(message: Message, tg_id: int) -> None:
+    """Карточка тарифа — общий код /status и кнопки `💎 Тариф`.
+
+    Для free прикладываем inline-кнопку апгрейда, для paid — голый текст
+    (апгрейд продлевает срок, но это уже /upgrade под рукой).
+    """
+    user = await ensure_user(tg_id)
     tier = _effective_tier(user)
     lines = [f"Тариф: *{tier}*"]
     if user.paid_until:
         lines.append(f"Действует до: {user.paid_until:%Y-%m-%d %H:%M UTC}")
     lines.append(f"Лимит подписок: {tier_limit(tier)}")
+    kb: InlineKeyboardMarkup | None = None
     if tier == Tier.FREE.value:
         s = get_settings()
         lines.append(
             f"\n/upgrade — {s.paid_tier_duration_days} дней за ⭐️{s.paid_tier_price_stars}"
         )
-    await message.answer("\n".join(lines), parse_mode="Markdown")
+        kb = about_kb()
+    await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await _send_tier(message, message.from_user.id)
 
 
 async def _send_upgrade_invoice(message: Message) -> None:
@@ -766,9 +769,106 @@ async def on_paid(message: Message) -> None:
     )
 
 
+# ---------- reply-keyboard handlers ----------
+# Регистрируются до fallback'а — иначе F.text-fallback проглотит текст кнопок.
+
+@dp.message(F.text == BTN_FIND)
+async def on_btn_find(message: Message) -> None:
+    await message.answer(
+        "Пришли адрес или название с командой /find перед ним.\n"
+        "Пример: `/find Минск Пулихова`",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(F.text == BTN_LIST)
+async def on_btn_list(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await _send_list(message, message.from_user.id)
+
+
+@dp.message(F.text == BTN_TIER)
+async def on_btn_tier(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await _send_tier(message, message.from_user.id)
+
+
+# ---------- admin ----------
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    """Сводка для админа: пользователи, подписки, платежи, доставки.
+
+    Не-админы получают тот же путь, что и любой неизвестный текст — fallback.
+    Молчим о существовании команды, чтобы не палить админ-инвентарь.
+    """
+    if message.from_user is None:
+        return
+    settings = get_settings()
+    if message.from_user.id not in settings.admin_ids_set():
+        return
+    now = datetime.now(UTC)
+    d7 = now - timedelta(days=7)
+    d30 = now - timedelta(days=30)
+    d1 = now - timedelta(days=1)
+    async with SessionLocal() as s:
+        users_total = (await s.execute(select(func.count(User.tg_id)))).scalar_one()
+        users_paid = (
+            await s.execute(
+                select(func.count(User.tg_id)).where(
+                    User.tier == Tier.PAID.value, User.paid_until > now
+                )
+            )
+        ).scalar_one()
+        new_7d = (
+            await s.execute(
+                select(func.count(User.tg_id)).where(User.created_at > d7)
+            )
+        ).scalar_one()
+        new_30d = (
+            await s.execute(
+                select(func.count(User.tg_id)).where(User.created_at > d30)
+            )
+        ).scalar_one()
+        subs_total = (
+            await s.execute(select(func.count(Subscription.id)))
+        ).scalar_one()
+        pay_7d = (
+            await s.execute(
+                select(func.count(Payment.charge_id)).where(Payment.paid_at > d7)
+            )
+        ).scalar_one()
+        pay_30d = (
+            await s.execute(
+                select(func.count(Payment.charge_id)).where(Payment.paid_at > d30)
+            )
+        ).scalar_one()
+        notif_24h = (
+            await s.execute(
+                select(func.count(NotificationLog.id)).where(
+                    NotificationLog.delivered_at > d1
+                )
+            )
+        ).scalar_one()
+    users_free = users_total - users_paid
+    text = (
+        "<b>Stats</b>\n\n"
+        f"<b>Users</b>: {users_total} (paid {users_paid} · free {users_free})\n"
+        f"  new 7d: {new_7d} · 30d: {new_30d}\n\n"
+        f"<b>Subs active</b>: {subs_total}\n\n"
+        f"<b>Payments</b>: 7d {pay_7d} · 30d {pay_30d}\n\n"
+        f"<b>Notifs delivered (24h)</b>: {notif_24h}"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
+# ---------- fallback ----------
+
 @dp.message(F.text)
 async def fallback(message: Message) -> None:
-    await message.answer("Не понял. Набери /start для списка команд.")
+    await message.answer("Не понял. /start — открыть меню.")
 
 
 # ---------- runner ----------
@@ -779,9 +879,12 @@ async def _runner() -> None:
     if not settings.tg_bot_token:
         raise RuntimeError("TG_BOT_TOKEN is not set")
     bot = Bot(settings.tg_bot_token)
-    # Зачищаем устаревший /-menu от прошлых деплоев. UX живёт на inline-кнопках
-    # /start, отдельный slash-список только путает.
-    await bot.set_my_commands([])
+    # Slash-меню — только два пункта-якоря. Остальное теперь живёт в
+    # persistent reply-клавиатуре, см. onboarding.main_reply_kb().
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать работу"),
+        BotCommand(command="about", description="О боте и контакты"),
+    ])
     redis = aioredis.from_url(settings.redis_url, decode_responses=True)
     global _redis_instance
     _redis_instance = redis

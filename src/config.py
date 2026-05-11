@@ -46,6 +46,13 @@ class Settings(BaseSettings):
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    # CSV of Telegram user ids with admin rights (/stats and future admin cmds).
+    # Список парсим лениво в admin_ids_set() — pydantic не любит list[int] из env.
+    admin_ids: str = Field(default="", alias="ADMIN_IDS")
+
+    def admin_ids_set(self) -> set[int]:
+        return {int(x) for x in self.admin_ids.split(",") if x.strip().isdigit()}
+
 
 @lru_cache
 def get_settings() -> Settings:
