@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.1.0...v0.1.1) (2026-05-11)
+
+
+### Documentation
+
+* document CI/release/deploy pipeline ([2054b84](https://github.com/devAsmodeus/Charger-Watcher/commit/2054b8480132fb15db758b008d126782d8fdab77))
+* document CI/release/deploy pipeline; scrub host from deploy.yml comments ([f8d7f0b](https://github.com/devAsmodeus/Charger-Watcher/commit/f8d7f0bd0652347be1b686c786a7448bce8af8be))
+
 ## 0.1.0 (2026-05-11)
 
 
