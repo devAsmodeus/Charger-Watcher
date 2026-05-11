@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
+from datetime import datetime  # noqa: TC003 — SQLAlchemy резолвит Mapped[datetime] в рантайме
 from enum import StrEnum
-from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
@@ -16,9 +16,6 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db.base import Base
-
-if TYPE_CHECKING:
-    from datetime import datetime
 
 
 class Tier(StrEnum):
