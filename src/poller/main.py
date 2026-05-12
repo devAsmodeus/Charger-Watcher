@@ -8,7 +8,7 @@ import time
 import orjson
 import redis.asyncio as aioredis
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from api.client import (
@@ -301,6 +301,29 @@ async def _get_central_device_info(
     return out
 
 
+async def _set_location_status(location_id: int, any_free: bool) -> None:
+    """Пишем агрегированный статус central-локации в БД.
+
+    Для central catalog endpoint статус не возвращает — без этой записи
+    `Location.last_status` остаётся NULL и /list показывает «статус
+    неизвестен» вечно. Маппинг: any_free → AVAILABLE / FULLY_USED.
+
+    Гонка между device-воркерами одной локации: «last writer wins».
+    Большинство станций — single-device, для multi-device возможен
+    кратковременный mismatch до следующего фрейма.
+    """
+    async with SessionLocal() as s:
+        await s.execute(
+            update(Location)
+            .where(Location.id == location_id)
+            .values(
+                last_status="AVAILABLE" if any_free else "FULLY_USED",
+                last_seen_at=func.now(),
+            )
+        )
+        await s.commit()
+
+
 async def _sse_worker(
     client: ProviderClient,
     redis: aioredis.Redis,
@@ -334,6 +357,10 @@ async def _sse_worker(
         last_any_free = True
     elif persisted == "0":
         last_any_free = False
+    # Один сидинг last_status в БД на жизнь воркера. Без этого central-
+    # локации сидят с NULL в БД, пока не случится transition (а у subscribed
+    # станций он редкий).
+    db_synced = False
     backoff = 1.0  # exponential reconnect backoff (seconds), cap at 60
 
     while True:
@@ -346,6 +373,14 @@ async def _sse_worker(
                     continue
                 last[code] = status
                 any_free = any(s in FREE_OCPP_STATUSES for s in last.values())
+
+                # Сид БД один раз за лайфтайм воркера. Делаем тут, а не
+                # в branch'е `last_any_free is None`, потому что на
+                # restart`е last_any_free уже взят из Redis — этой ветки
+                # не будет, и БД останется с NULL.
+                if not db_synced:
+                    await _set_location_status(location_id, any_free)
+                    db_synced = True
 
                 if last_any_free is None:
                     last_any_free = any_free
@@ -364,6 +399,7 @@ async def _sse_worker(
                 await redis.hset(
                     SSE_FREE_HASH, str(device_number), "1" if any_free else "0"
                 )
+                await _set_location_status(location_id, any_free)
                 if any_free:
                     # location transitioned to having at least one free connector
                     now = int(time.time())
