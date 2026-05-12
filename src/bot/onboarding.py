@@ -17,6 +17,8 @@ BTN_LIST = "📋 Подписки"
 BTN_TIER = "💎 Тариф"
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_REFERRAL = "🎁 Пригласить друга"
+BTN_PRIVACY = "📜 Политика"
+BTN_DELETE = "🗑 Удалить данные"
 
 GREETING_NEW = (
     "👋 Я слежу за свободными ЭЗС в Беларуси "
@@ -66,6 +68,10 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
                 KeyboardButton(text=BTN_SETTINGS),
                 KeyboardButton(text=BTN_REFERRAL),
             ],
+            [
+                KeyboardButton(text=BTN_PRIVACY),
+                KeyboardButton(text=BTN_DELETE),
+            ],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -73,26 +79,9 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
 
 
 def about_kb() -> InlineKeyboardMarkup:
-    """Кнопки под текстом /about: апгрейд + системные действия (политика, удаление)."""
-    s = get_settings()
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"💎 Расширить лимиты — {s.paid_tier_price_stars} ⭐",
-                    callback_data="onboard:upgrade",
-                )
-            ],
-            [
-                InlineKeyboardButton(text="📜 Политика", callback_data="onboard:privacy"),
-                InlineKeyboardButton(text="🗑 Удалить данные", callback_data="onboard:delete"),
-            ],
-        ]
-    )
-
-
-def upgrade_only_kb() -> InlineKeyboardMarkup:
-    """Только апгрейд — для карточки /Тариф у free-юзера. Без системных кнопок."""
+    """Под текстом /about и в карточке /Тариф у free — только апгрейд.
+    Политика/удаление переехали на reply-клавиатуру (BTN_PRIVACY/BTN_DELETE).
+    """
     s = get_settings()
     return InlineKeyboardMarkup(
         inline_keyboard=[

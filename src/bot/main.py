@@ -30,8 +30,10 @@ from sqlalchemy.exc import IntegrityError
 from bot.geo import find_nearby
 from bot.notifier import Notifier, stale_claim_reaper, tier_reaper
 from bot.onboarding import (
+    BTN_DELETE,
     BTN_FIND,
     BTN_LIST,
+    BTN_PRIVACY,
     BTN_REFERRAL,
     BTN_SETTINGS,
     BTN_TIER,
@@ -40,7 +42,6 @@ from bot.onboarding import (
     about_kb,
     about_text,
     main_reply_kb,
-    upgrade_only_kb,
 )
 from config import get_settings
 from db.models import (
@@ -656,14 +657,6 @@ async def on_onboard_callback(cb: CallbackQuery) -> None:
         await cb.answer()
         await _send_upgrade_invoice(cb.message)
         return
-    if action == "privacy":
-        await cb.answer()
-        await _send_privacy(cb.message)
-        return
-    if action == "delete":
-        await cb.answer()
-        await _send_delete_confirm(cb.message)
-        return
     await cb.answer("Неизвестное действие")
 
 
@@ -722,9 +715,7 @@ async def _send_tier(message: Message, tg_id: int) -> None:
             f"Стоимость: <b>{s.paid_tier_price_stars} ⭐</b> / "
             f"{s.paid_tier_duration_days} дней."
         )
-    kb: InlineKeyboardMarkup | None = (
-        upgrade_only_kb() if tier == Tier.FREE.value else None
-    )
+    kb: InlineKeyboardMarkup | None = about_kb() if tier == Tier.FREE.value else None
     await message.answer("\n".join(rows), parse_mode="HTML", reply_markup=kb)
 
 
@@ -970,6 +961,18 @@ async def on_btn_tier(message: Message) -> None:
     if message.from_user is None:
         return
     await _send_tier(message, message.from_user.id)
+
+
+@dp.message(F.text == BTN_PRIVACY)
+async def on_btn_privacy(message: Message) -> None:
+    await _send_privacy(message)
+
+
+@dp.message(F.text == BTN_DELETE)
+async def on_btn_delete(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await _send_delete_confirm(message)
 
 
 # ---------- settings (quiet hours) ----------
