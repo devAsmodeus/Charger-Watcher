@@ -615,23 +615,44 @@ async def cmd_unsubscribe(message: Message, command: CommandObject) -> None:
 async def _send_tier(message: Message, tg_id: int) -> None:
     """Карточка тарифа — общий код /status и кнопки `💎 Тариф`.
 
-    Для free прикладываем inline-кнопку апгрейда, для paid — голый текст
-    (апгрейд продлевает срок, но это уже /upgrade под рукой).
+    HTML-вёрстка под стиль карточек /nearby и /find. Для free добавляется
+    блок «как расширить» + inline-кнопка апгрейда; paid показывает,
+    сколько дней осталось до истечения.
     """
     user = await ensure_user(tg_id)
     tier = _effective_tier(user)
-    lines = [f"Тариф: *{tier}*"]
-    if user.paid_until:
-        lines.append(f"Действует до: {user.paid_until:%Y-%m-%d %H:%M UTC}")
-    lines.append(f"Лимит подписок: {tier_limit(tier)}")
-    kb: InlineKeyboardMarkup | None = None
-    if tier == Tier.FREE.value:
-        s = get_settings()
-        lines.append(
-            f"\n/upgrade — {s.paid_tier_duration_days} дней за ⭐️{s.paid_tier_price_stars}"
+    used = await user_subscription_count(tg_id)
+    limit = tier_limit(tier)
+    s = get_settings()
+
+    if tier == Tier.PAID.value:
+        head = "💎 <b>Тариф: paid</b>"
+    else:
+        head = "🆓 <b>Тариф: free</b>"
+
+    rows = [head, ""]
+    if tier == Tier.PAID.value and user.paid_until:
+        now = datetime.now(UTC)
+        delta = user.paid_until - now
+        days_left = max(0, delta.days)
+        rows.append(
+            f"Действует до: <b>{user.paid_until:%d.%m.%Y, %H:%M}</b> UTC "
+            f"(осталось {days_left} дн.)"
         )
-        kb = about_kb()
-    await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+    rows.append(f"Подписки: <b>{used} / {limit}</b>")
+    if tier == Tier.FREE.value:
+        rows.append(f"Задержка уведомлений: {s.free_tier_notify_delay_sec // 60} мин")
+        rows.append("")
+        rows.append(
+            f"💎 На paid — до {s.paid_tier_max_subscriptions} подписок и "
+            "мгновенные пуши без задержки."
+        )
+        rows.append(
+            f"Стоимость: <b>{s.paid_tier_price_stars} ⭐</b> / "
+            f"{s.paid_tier_duration_days} дней."
+        )
+    kb: InlineKeyboardMarkup | None = about_kb() if tier == Tier.FREE.value else None
+    await message.answer("\n".join(rows), parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(Command("status"))
