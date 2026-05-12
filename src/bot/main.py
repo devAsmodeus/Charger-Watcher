@@ -885,6 +885,129 @@ async def cmd_stats(message: Message) -> None:
     await message.answer(text, parse_mode="HTML")
 
 
+@dp.message(Command("refund"))
+async def cmd_refund(message: Message, command: CommandObject) -> None:
+    """Refund последнего платежа юзера, downgrade до free, чистка подписок.
+
+    Использование: /refund <tg_id>. Доступно только админам.
+
+    Шаги:
+      1. Найти последний `Payment` юзера с `refunded_at IS NULL`.
+      2. Дёрнуть `bot.refund_star_payment` — если упадёт, БД не трогаем.
+      3. Поставить `refunded_at`, `tier=free`, `paid_until=NULL`.
+      4. Удалить все подписки кроме самой старой (free-лимит = 1).
+         Cascade FK снесёт связанный notification_log сам.
+      5. Уведомить юзера. Подтвердить админу.
+
+    21-дневное окно refund'а — на стороне Telegram; если просрочено,
+    `refund_star_payment` бросит исключение и мы откатимся.
+    """
+    if message.from_user is None:
+        return
+    settings = get_settings()
+    if message.from_user.id not in settings.admin_ids_set():
+        return
+
+    raw = (command.args or "").strip()
+    if not raw.isdigit():
+        await message.answer("Использование: <code>/refund &lt;tg_id&gt;</code>", parse_mode="HTML")
+        return
+    target_tg = int(raw)
+
+    async with SessionLocal() as s:
+        user = await s.get(User, target_tg)
+        if user is None:
+            await message.answer(f"Юзер <code>{target_tg}</code> не найден.", parse_mode="HTML")
+            return
+        payment = (
+            await s.execute(
+                select(Payment)
+                .where(
+                    Payment.user_tg_id == target_tg,
+                    Payment.refunded_at.is_(None),
+                )
+                .order_by(Payment.paid_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if payment is None:
+            await message.answer(
+                f"У юзера <code>{target_tg}</code> нет неотрефанженных платежей.",
+                parse_mode="HTML",
+            )
+            return
+
+        # Telegram refund API — сначала зовём её, только потом меняем БД.
+        # Если упадёт (просрочено окно, сеть) — БД не тронем, юзер останется paid.
+        try:
+            await message.bot.refund_star_payment(
+                user_id=target_tg,
+                telegram_payment_charge_id=payment.charge_id,
+            )
+        except Exception as e:
+            log.warning(
+                "refund_api_failed",
+                admin=message.from_user.id,
+                target=target_tg,
+                charge=payment.charge_id,
+                err=str(e),
+            )
+            await message.answer(f"Refund API упал: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+            return
+
+        payment.refunded_at = datetime.now(UTC)
+        user.tier = Tier.FREE.value
+        user.paid_until = None
+
+        # Сохраняем самую старую подписку (created_at ASC, первый id),
+        # удаляем остальные. NotificationLog → Subscription cascade FK
+        # снесёт связанные строки.
+        sub_ids = (
+            await s.execute(
+                select(Subscription.id)
+                .where(Subscription.user_tg_id == target_tg)
+                .order_by(Subscription.created_at.asc())
+            )
+        ).scalars().all()
+        to_delete = list(sub_ids[1:])  # all except first (oldest)
+        if to_delete:
+            await s.execute(
+                delete(Subscription).where(Subscription.id.in_(to_delete))
+            )
+        await s.commit()
+
+    log.info(
+        "refund_ok",
+        admin=message.from_user.id,
+        target=target_tg,
+        charge=payment.charge_id,
+        amount=payment.amount_stars,
+        subs_deleted=len(to_delete),
+    )
+
+    # Уведомляем юзера. Если он удалил бота — Telegram бросит, не падаем.
+    try:
+        user_text = (
+            "💸 <b>Возврат оформлен</b>\n\n"
+            f"{payment.amount_stars} ⭐ вернулись на твой Stars-баланс.\n"
+            "Тариф снят до free."
+        )
+        if to_delete:
+            user_text += (
+                f"\nПодписок удалено: {len(to_delete)}. "
+                "Оставлена самая старая (free-лимит = 1)."
+            )
+        await message.bot.send_message(target_tg, user_text, parse_mode="HTML")
+    except Exception as e:
+        log.warning("refund_notify_failed", target=target_tg, err=str(e))
+
+    await message.answer(
+        f"✔ Refund <b>{payment.amount_stars} ⭐</b> → <code>{target_tg}</code>\n"
+        f"Subs удалено: {len(to_delete)}",
+        parse_mode="HTML",
+    )
+
+
 # ---------- fallback ----------
 
 @dp.message(F.text)
