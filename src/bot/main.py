@@ -40,6 +40,7 @@ from bot.onboarding import (
     about_kb,
     about_text,
     main_reply_kb,
+    upgrade_only_kb,
 )
 from config import get_settings
 from db.models import (
@@ -301,26 +302,23 @@ async def cmd_about(message: Message) -> None:
     await message.answer(about_text(), parse_mode="HTML", reply_markup=about_kb())
 
 
-@dp.message(Command("privacy"))
-async def cmd_privacy(message: Message) -> None:
+async def _send_privacy(message: Message) -> None:
     await message.answer(
-        "*Политика конфиденциальности*\n\n"
+        "<b>Политика конфиденциальности</b>\n\n"
         "Сервис хранит минимум данных:\n"
         "• Ваш Telegram ID (без имени/телефона)\n"
         "• Список ваших подписок (id локации)\n"
         "• Лог отправленных уведомлений (для дедупа)\n\n"
         "Данные не передаются третьим лицам и используются только для рассылки уведомлений. "
-        "Удалить все свои данные можно командой /delete\\_me — действие необратимо.\n\n"
+        "Удалить все свои данные можно через <b>/about → 🗑 Удалить данные</b> "
+        "или командой <code>/delete_me</code> — действие необратимо.\n\n"
         "Сервис не является официальным от оператора зарядных станций. "
-        "Вопросы и жалобы — через /start → контакты автора.",
-        parse_mode="Markdown",
+        "Вопросы и жалобы — через /about → контакты автора.",
+        parse_mode="HTML",
     )
 
 
-@dp.message(Command("delete_me"))
-async def cmd_delete_me(message: Message) -> None:
-    if message.from_user is None:
-        return
+async def _send_delete_confirm(message: Message) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="❌ Да, удалить навсегда", callback_data="delme:y")],
@@ -335,6 +333,18 @@ async def cmd_delete_me(message: Message) -> None:
         "Действие необратимо.",
         reply_markup=kb,
     )
+
+
+@dp.message(Command("privacy"))
+async def cmd_privacy(message: Message) -> None:
+    await _send_privacy(message)
+
+
+@dp.message(Command("delete_me"))
+async def cmd_delete_me(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await _send_delete_confirm(message)
 
 
 @dp.callback_query(F.data.startswith("delme:"))
@@ -628,9 +638,11 @@ async def on_unsub_callback(cb: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("onboard:"))
 async def on_onboard_callback(cb: CallbackQuery) -> None:
-    """Остался только `upgrade` — остальная навигация ушла в reply-клавиатуру.
+    """Inline-кнопки из /about: апгрейд, политика, удаление данных.
 
-    Кнопка вызывается из inline-клавиатур в `/about` и в reply-обработчике `💎 Тариф`.
+    Callback `cb.message` — это бот-сообщение `/about`, на которое навешана
+    клавиатура; reply через `.answer()` шлёт НОВОЕ сообщение в чат, не
+    портя текст /about.
     """
     if cb.from_user is None or cb.data is None or cb.message is None:
         return
@@ -638,6 +650,14 @@ async def on_onboard_callback(cb: CallbackQuery) -> None:
     if action == "upgrade":
         await cb.answer()
         await _send_upgrade_invoice(cb.message)
+        return
+    if action == "privacy":
+        await cb.answer()
+        await _send_privacy(cb.message)
+        return
+    if action == "delete":
+        await cb.answer()
+        await _send_delete_confirm(cb.message)
         return
     await cb.answer("Неизвестное действие")
 
@@ -697,7 +717,9 @@ async def _send_tier(message: Message, tg_id: int) -> None:
             f"Стоимость: <b>{s.paid_tier_price_stars} ⭐</b> / "
             f"{s.paid_tier_duration_days} дней."
         )
-    kb: InlineKeyboardMarkup | None = about_kb() if tier == Tier.FREE.value else None
+    kb: InlineKeyboardMarkup | None = (
+        upgrade_only_kb() if tier == Tier.FREE.value else None
+    )
     await message.answer("\n".join(rows), parse_mode="HTML", reply_markup=kb)
 
 

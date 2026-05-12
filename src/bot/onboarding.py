@@ -73,6 +73,26 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
 
 
 def about_kb() -> InlineKeyboardMarkup:
+    """Кнопки под текстом /about: апгрейд + системные действия (политика, удаление)."""
+    s = get_settings()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"💎 Расширить лимиты — {s.paid_tier_price_stars} ⭐",
+                    callback_data="onboard:upgrade",
+                )
+            ],
+            [
+                InlineKeyboardButton(text="📜 Политика", callback_data="onboard:privacy"),
+                InlineKeyboardButton(text="🗑 Удалить данные", callback_data="onboard:delete"),
+            ],
+        ]
+    )
+
+
+def upgrade_only_kb() -> InlineKeyboardMarkup:
+    """Только апгрейд — для карточки /Тариф у free-юзера. Без системных кнопок."""
     s = get_settings()
     return InlineKeyboardMarkup(
         inline_keyboard=[
