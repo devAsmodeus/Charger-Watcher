@@ -78,7 +78,14 @@ async def upsert_locations(operator: Operator, items: list[LocationSummary]) -> 
                 "address": stmt.excluded.address,
                 "latitude": stmt.excluded.latitude,
                 "longitude": stmt.excluded.longitude,
-                "last_status": stmt.excluded.last_status,
+                # COALESCE: catalog endpoint оператора central не отдаёт
+                # статус, и raw upsert затирал бы значение, поставленное
+                # SSE-воркером, обратно в NULL каждый sync_central_catalog
+                # тик. Берём new value, если он не None, иначе сохраняем
+                # старое.
+                "last_status": func.coalesce(
+                    stmt.excluded.last_status, Location.last_status
+                ),
                 "last_seen_at": func.now(),
             },
         ).returning(Location.external_id, Location.id)
