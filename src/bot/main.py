@@ -32,6 +32,7 @@ from bot.notifier import Notifier, tier_reaper
 from bot.onboarding import (
     BTN_FIND,
     BTN_LIST,
+    BTN_REFERRAL,
     BTN_SETTINGS,
     BTN_TIER,
     GREETING_NEW,
@@ -45,6 +46,7 @@ from db.models import (
     Location,
     NotificationLog,
     Payment,
+    Referral,
     Subscription,
     SubscriptionMode,
     Tier,
@@ -239,11 +241,57 @@ async def _resolve_connector_token(
 
 # ---------- handlers ----------
 
+async def _try_record_referral(invitee_tg: int, raw_payload: str) -> int | None:
+    """Если payload похож на `ref_<inviter_tg>` и проходит анти-фрод —
+    пишем строку в `referrals`. Возвращает tg_id инвайтера или None.
+
+    Анти-фрод:
+      - формат `ref_<digits>`;
+      - inviter != invitee (CHECK на уровне БД, дублируем тут для UX);
+      - inviter существует в users (иначе ссылка бесполезна);
+      - у инвайти ещё нет записи в referrals (PK invitee_tg_id).
+    """
+    if not raw_payload.startswith("ref_"):
+        return None
+    rest = raw_payload[4:]
+    if not rest.isdigit():
+        return None
+    inviter_tg = int(rest)
+    if inviter_tg == invitee_tg:
+        return None
+    async with SessionLocal() as s:
+        inviter = await s.get(User, inviter_tg)
+        if inviter is None:
+            return None
+        stmt = (
+            pg_insert(Referral)
+            .values(invitee_tg_id=invitee_tg, inviter_tg_id=inviter_tg)
+            .on_conflict_do_nothing(index_elements=["invitee_tg_id"])
+        )
+        result = await s.execute(stmt)
+        await s.commit()
+        return inviter_tg if result.rowcount > 0 else None
+
+
 @dp.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, command: CommandObject) -> None:
     if message.from_user is None:
         return
     _, is_new = await ensure_user_with_flag(message.from_user.id)
+    raw = (command.args or "").strip()
+    if raw:
+        inviter_tg = await _try_record_referral(message.from_user.id, raw)
+        if inviter_tg is not None:
+            s = get_settings()
+            log.info("referral_recorded", invitee=message.from_user.id, inviter=inviter_tg)
+            # Юзеру сообщим о скидке на первый paid отдельным сообщением —
+            # после greeting и инлайн-клавы. Чтобы не пропало.
+            await message.answer(
+                f"🎁 Ты пришёл по приглашению. Первый <b>paid</b> "
+                f"со скидкой — <b>{s.referral_invitee_price_stars} ⭐</b> "
+                f"вместо {s.paid_tier_price_stars} ⭐. /upgrade когда готов.",
+                parse_mode="HTML",
+            )
     greeting = GREETING_NEW if is_new else GREETING_RETURNING
     await message.answer(greeting, reply_markup=main_reply_kb())
 
@@ -663,17 +711,41 @@ async def cmd_status(message: Message) -> None:
     await _send_tier(message, message.from_user.id)
 
 
+async def _has_unclaimed_referral(tg_id: int) -> bool:
+    """True если у юзера есть запись в `referrals` с `invitee_charge_id IS NULL`.
+
+    Используется в _send_upgrade_invoice и pre_checkout для решения о скидке.
+    """
+    async with SessionLocal() as s:
+        ref = await s.get(Referral, tg_id)
+    return ref is not None and ref.invitee_charge_id is None
+
+
 async def _send_upgrade_invoice(message: Message) -> None:
     s = get_settings()
-    await message.answer_invoice(
-        title="Charger Watcher — Paid",
-        description=(
+    user_id = message.from_user.id if message.from_user else 0
+    is_ref = bool(user_id) and await _has_unclaimed_referral(user_id)
+    if is_ref:
+        amount = s.referral_invitee_price_stars
+        payload = f"paid:{s.paid_tier_duration_days}:ref"
+        description = (
+            f"🎁 По приглашению: {amount} ⭐ вместо {s.paid_tier_price_stars} ⭐.\n"
+            f"{s.paid_tier_duration_days} дней paid · до {s.paid_tier_max_subscriptions} подписок, "
+            "уведомления без задержки."
+        )
+    else:
+        amount = s.paid_tier_price_stars
+        payload = f"paid:{s.paid_tier_duration_days}"
+        description = (
             f"{s.paid_tier_duration_days} дней: до {s.paid_tier_max_subscriptions} подписок, "
             "мгновенные уведомления без задержки."
-        ),
-        prices=[LabeledPrice(label="Подписка", amount=s.paid_tier_price_stars)],
+        )
+    await message.answer_invoice(
+        title="Charger Watcher — Paid",
+        description=description,
+        prices=[LabeledPrice(label="Подписка", amount=amount)],
         currency="XTR",
-        payload=f"paid:{s.paid_tier_duration_days}",
+        payload=payload,
         provider_token="",
     )
 
@@ -694,16 +766,33 @@ async def pre_checkout(q: PreCheckoutQuery) -> None:
     ``on_paid`` will hand out PAID. We check (currency, amount, payload)
     against the canonical values from settings; any mismatch is rejected
     with a user-visible message and logged for audit.
+
+    Поддерживаются два варианта payload:
+      - `paid:<days>`     — стандартная цена
+      - `paid:<days>:ref` — скидка для инвайти, только если у юзера есть
+        unclaimed referral (invitee_charge_id IS NULL)
     """
     s = get_settings()
-    expected_payload = f"paid:{s.paid_tier_duration_days}"
+    is_ref = (q.invoice_payload or "").endswith(":ref")
+    expected_payload = (
+        f"paid:{s.paid_tier_duration_days}:ref"
+        if is_ref
+        else f"paid:{s.paid_tier_duration_days}"
+    )
+    expected_amount = (
+        s.referral_invitee_price_stars if is_ref else s.paid_tier_price_stars
+    )
     reason: str | None = None
     if q.currency != "XTR":
         reason = f"currency={q.currency}"
-    elif q.total_amount != s.paid_tier_price_stars:
-        reason = f"amount={q.total_amount} expected={s.paid_tier_price_stars}"
+    elif q.total_amount != expected_amount:
+        reason = f"amount={q.total_amount} expected={expected_amount}"
     elif q.invoice_payload != expected_payload:
         reason = f"payload={q.invoice_payload!r} expected={expected_payload!r}"
+    elif is_ref and not await _has_unclaimed_referral(q.from_user.id):
+        # Юзер пытается заплатить со скидкой, но у него нет валидного
+        # реферала или скидка уже использована.
+        reason = "no_unclaimed_referral"
 
     if reason is not None:
         log.warning(
@@ -735,12 +824,15 @@ async def on_paid(message: Message) -> None:
         return
     sp = message.successful_payment
     payload = sp.invoice_payload or ""
+    settings = get_settings()
     try:
-        days = int(payload.split(":", 1)[1])
+        days = int(payload.split(":")[1])
     except (ValueError, IndexError):
-        days = get_settings().paid_tier_duration_days
+        days = settings.paid_tier_duration_days
+    is_ref_payment = payload.endswith(":ref")
 
     now = datetime.now(UTC)
+    reward_inviter: int | None = None  # tg_id если пора начислить бонус
     async with SessionLocal() as s:
         # Сначала фиксируем платёжку — без telegram_payment_charge_id
         # refund физически невозможен (Refund Policy §3 → refundStarsCharge).
@@ -778,7 +870,28 @@ async def on_paid(message: Message) -> None:
             base = user.paid_until if user.paid_until and user.paid_until > now else now
             user.tier = Tier.PAID.value
             user.paid_until = base + timedelta(days=days)
+
+        # Реферальный reward: только если payload ref, юзер действительно
+        # инвайти и invitee_charge_id ещё пуст (защита от двойного бонуса).
+        if is_ref_payment:
+            ref = await s.get(Referral, message.from_user.id)
+            if ref is not None and ref.invitee_charge_id is None:
+                ref.invitee_charge_id = sp.telegram_payment_charge_id
+                ref.rewarded_at = now
+                inviter = await s.get(User, ref.inviter_tg_id)
+                if inviter is not None:
+                    base_i = (
+                        inviter.paid_until
+                        if inviter.paid_until and inviter.paid_until > now
+                        else now
+                    )
+                    inviter.tier = Tier.PAID.value
+                    inviter.paid_until = base_i + timedelta(
+                        days=settings.referral_reward_days
+                    )
+                    reward_inviter = ref.inviter_tg_id
         await s.commit()
+
     await message.answer(
         "✅ Оплата получена. Лимит подписок увеличен, уведомления без задержки."
     )
@@ -788,7 +901,25 @@ async def on_paid(message: Message) -> None:
         days=days,
         charge=sp.telegram_payment_charge_id,
         amount=sp.total_amount,
+        ref=is_ref_payment,
     )
+    if reward_inviter is not None:
+        log.info(
+            "referral_rewarded",
+            inviter=reward_inviter,
+            invitee=message.from_user.id,
+            days=settings.referral_reward_days,
+        )
+        try:
+            await message.bot.send_message(
+                reward_inviter,
+                f"🎁 Друг по твоей ссылке оплатил paid! "
+                f"+{settings.referral_reward_days} дней начислены.",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "referral_notify_failed", inviter=reward_inviter, err=str(e)
+            )
 
 
 # ---------- reply-keyboard handlers ----------
@@ -854,6 +985,48 @@ async def on_btn_settings(message: Message) -> None:
         "Выбери пресет — уведомления внутри окна откладываются до выхода:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=_qh_kb())
+
+
+# ---------- referrals ----------
+
+@dp.message(F.text == BTN_REFERRAL)
+async def on_btn_referral(message: Message) -> None:
+    """Показ персональной реф-ссылки + статус (сколько пригласил, сколько
+    наградилось).
+    """
+    if message.from_user is None or message.bot is None:
+        return
+    await ensure_user(message.from_user.id)
+    me = await message.bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
+    s = get_settings()
+    async with SessionLocal() as ses:
+        total = (
+            await ses.execute(
+                select(func.count(Referral.invitee_tg_id)).where(
+                    Referral.inviter_tg_id == message.from_user.id
+                )
+            )
+        ).scalar_one()
+        rewarded = (
+            await ses.execute(
+                select(func.count(Referral.invitee_tg_id)).where(
+                    Referral.inviter_tg_id == message.from_user.id,
+                    Referral.rewarded_at.is_not(None),
+                )
+            )
+        ).scalar_one()
+    text = (
+        "🎁 <b>Приглашай друзей</b>\n\n"
+        f"Друг получает первый paid со скидкой — <b>{s.referral_invitee_price_stars} ⭐</b> "
+        f"вместо {s.paid_tier_price_stars} ⭐.\n"
+        f"Ты получаешь <b>+{s.referral_reward_days} дней paid</b> "
+        "за каждого, кто оплатил по твоей ссылке.\n\n"
+        "Твоя ссылка (нажми, чтобы скопировать):\n"
+        f"<code>{html.escape(link)}</code>\n\n"
+        f"Приглашено: <b>{total}</b> · оплатили: <b>{rewarded}</b>"
+    )
+    await message.answer(text, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("qh:"))
@@ -1047,6 +1220,30 @@ async def cmd_refund(message: Message, command: CommandObject) -> None:
         user.tier = Tier.FREE.value
         user.paid_until = None
 
+        # Реферальный reverse: если этот charge запустил начисление инвайтеру,
+        # отнимаем `referral_reward_days` обратно. Если в результате
+        # `paid_until <= now`, инвайтер сваливается в free (tier_reaper
+        # подхватит, но мы и сами поставим — UX чище).
+        ref = (
+            await s.execute(
+                select(Referral).where(Referral.invitee_charge_id == payment.charge_id)
+            )
+        ).scalar_one_or_none()
+        reward_reversed_for: int | None = None
+        if ref is not None:
+            inviter = await s.get(User, ref.inviter_tg_id)
+            if inviter is not None and inviter.paid_until is not None:
+                inviter.paid_until -= timedelta(days=settings.referral_reward_days)
+                now_ref = datetime.now(UTC)
+                if inviter.paid_until <= now_ref:
+                    inviter.tier = Tier.FREE.value
+                    inviter.paid_until = None
+                reward_reversed_for = ref.inviter_tg_id
+            # Очищаем связку — повторно «не получится» дать бонус по тому же
+            # charge'у (даже если он каким-то образом всплывёт).
+            ref.invitee_charge_id = None
+            ref.rewarded_at = None
+
         # Сохраняем самую старую подписку (created_at ASC, первый id),
         # удаляем остальные. NotificationLog → Subscription cascade FK
         # снесёт связанные строки.
@@ -1071,7 +1268,19 @@ async def cmd_refund(message: Message, command: CommandObject) -> None:
         charge=payment.charge_id,
         amount=payment.amount_stars,
         subs_deleted=len(to_delete),
+        ref_reversed=reward_reversed_for,
     )
+    if reward_reversed_for is not None:
+        try:
+            await message.bot.send_message(
+                reward_reversed_for,
+                f"⚠️ Платёж по твоей реферальной ссылке отменён. "
+                f"−{settings.referral_reward_days} дней paid списаны.",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "ref_reverse_notify_failed", inviter=reward_reversed_for, err=str(e)
+            )
 
     # Уведомляем юзера. Если он удалил бота — Telegram бросит, не падаем.
     try:

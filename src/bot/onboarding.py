@@ -16,7 +16,7 @@ BTN_FIND = "🔎 По адресу"
 BTN_LIST = "📋 Подписки"
 BTN_TIER = "💎 Тариф"
 BTN_SETTINGS = "⚙️ Настройки"
-# BTN_REFERRAL — добавится с реализацией рефералки в 3-й ряд рядом с настройками.
+BTN_REFERRAL = "🎁 Пригласить друга"
 
 GREETING_NEW = (
     "👋 Я слежу за свободными ЭЗС в Беларуси "
@@ -62,10 +62,9 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
                 KeyboardButton(text=BTN_LIST),
                 KeyboardButton(text=BTN_TIER),
             ],
-            # 3-й ряд: пока одна кнопка. 🎁 Пригласить друга добавится
-            # рядом, когда реализуем рефералку.
             [
                 KeyboardButton(text=BTN_SETTINGS),
+                KeyboardButton(text=BTN_REFERRAL),
             ],
         ],
         resize_keyboard=True,

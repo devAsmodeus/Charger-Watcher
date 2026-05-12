@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     paid_tier_price_stars: int = Field(default=150, alias="PAID_TIER_PRICE_STARS")
     paid_tier_duration_days: int = Field(default=30, alias="PAID_TIER_DURATION_DAYS")
 
+    # Реферальная программа.
+    # Инвайти платит за первый paid `referral_invitee_price_stars` ⭐ (скидка).
+    # Инвайтер получает +`referral_reward_days` дней paid после оплаты.
+    referral_invitee_price_stars: int = Field(default=100, alias="REFERRAL_INVITEE_PRICE_STARS")
+    referral_reward_days: int = Field(default=15, alias="REFERRAL_REWARD_DAYS")
+
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # CSV of Telegram user ids with admin rights (/stats and future admin cmds).

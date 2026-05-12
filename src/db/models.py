@@ -5,6 +5,7 @@ from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -137,6 +138,45 @@ class Payment(Base):
     )
     refunded_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
+    )
+
+
+class Referral(Base):
+    """Кто пригласил кого. Reverse-логика: refund инвайти откатывает бонус.
+
+    invitee_tg_id — PK: один и тот же юзер не может быть приглашён дважды.
+    CHECK inviter <> invitee — анти-self-referral.
+    invitee_charge_id заполняется в on_paid, обнуляется в /refund для отката
+    +N дней инвайтеру (см. settings.referral_reward_days).
+    """
+
+    __tablename__ = "referrals"
+    __table_args__ = (
+        CheckConstraint("inviter_tg_id <> invitee_tg_id", name="ck_referrals_no_self"),
+        Index("ix_referrals_inviter", "inviter_tg_id"),
+        Index("ix_referrals_charge", "invitee_charge_id"),
+    )
+
+    invitee_tg_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.tg_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    inviter_tg_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.tg_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    rewarded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    invitee_charge_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("payments.charge_id", ondelete="SET NULL"),
+        default=None,
     )
 
 
