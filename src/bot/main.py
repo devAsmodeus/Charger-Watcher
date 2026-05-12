@@ -674,10 +674,7 @@ async def _send_tier(message: Message, tg_id: int) -> None:
     limit = tier_limit(tier)
     s = get_settings()
 
-    if tier == Tier.PAID.value:
-        head = "💎 <b>Тариф: paid</b>"
-    else:
-        head = "🆓 <b>Тариф: free</b>"
+    head = "💎 <b>Тариф: paid</b>" if tier == Tier.PAID.value else "🆓 <b>Тариф: free</b>"
 
     rows = [head, ""]
     if tier == Tier.PAID.value and user.paid_until:
