@@ -595,6 +595,54 @@ class Notifier:
                 cursor = ">"
 
 
+# Окно, в течение которого «висячий» claim считается живым in-flight'ом,
+# а не последствием краша. Нормальная отправка занимает <1 сек, 5 минут —
+# с большим запасом даже под TG flood-wait (60-300 сек). Тика reaper'а
+# тоже 5 минут — частить нет смысла, claims редкие.
+_STALE_CLAIM_CUTOFF_MIN = 5
+_STALE_CLAIM_REAPER_INTERVAL_SEC = 300
+
+
+async def stale_claim_reaper(stop: asyncio.Event) -> None:
+    """Удаляет «висячие» notification_log claims, оставшиеся после крашей.
+
+    Claim — строка `(sub, loc, epoch, delivered_at=NULL)`, вставленная до
+    отправки и которую должен был commit'нуть (`UPDATE delivered_at`) или
+    удалить (`DELETE`) тот же воркер. Если процесс упал между INSERT и
+    одним из них — строка остаётся вечно, и следующий INSERT по тому же
+    `(sub, loc, epoch)` ловит unique-конфликт, dispatch_event тихо
+    пропускает уведомление.
+
+    Сценарий редкий (нужен crash между двумя async DB-вызовами), но
+    «тихая потеря» — топ-1 класс багов для этого бота. Этот reaper
+    закрывает класс целиком: через ≤cutoff минут висячая строка
+    удаляется, следующий INSERT проходит, доставка наверстаёт.
+    """
+    while not stop.is_set():
+        try:
+            async with SessionLocal() as s:
+                cutoff = datetime.now(UTC) - timedelta(
+                    minutes=_STALE_CLAIM_CUTOFF_MIN
+                )
+                result = await s.execute(
+                    delete(NotificationLog).where(
+                        and_(
+                            NotificationLog.delivered_at.is_(None),
+                            NotificationLog.sent_at < cutoff,
+                        )
+                    )
+                )
+                await s.commit()
+                if result.rowcount:
+                    log.info("stale_claims_reaped", count=result.rowcount)
+        except Exception as e:  # noqa: BLE001
+            log.exception("stale_reaper_failed", err=str(e))
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                stop.wait(), timeout=_STALE_CLAIM_REAPER_INTERVAL_SEC
+            )
+
+
 async def tier_reaper(stop: asyncio.Event) -> None:
     """Periodically demote expired paid users to free tier in the DB.
 

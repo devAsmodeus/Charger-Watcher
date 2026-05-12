@@ -28,7 +28,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from bot.geo import find_nearby
-from bot.notifier import Notifier, tier_reaper
+from bot.notifier import Notifier, stale_claim_reaper, tier_reaper
 from bot.onboarding import (
     BTN_FIND,
     BTN_LIST,
@@ -1342,6 +1342,7 @@ async def _runner() -> None:
         asyncio.create_task(notifier.consume_events(stop), name="notifier-consume"),
         asyncio.create_task(notifier.delayed_worker(stop), name="notifier-delayed"),
         asyncio.create_task(tier_reaper(stop), name="tier-reaper"),
+        asyncio.create_task(stale_claim_reaper(stop), name="stale-claim-reaper"),
     ]
     log.info("bot_start")
     try:
