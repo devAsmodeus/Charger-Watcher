@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.0](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.1.1...v0.2.0) (2026-05-12)
+
+
+### Features
+
+* expose /privacy and /delete_me as inline buttons in /about ([8490782](https://github.com/devAsmodeus/Charger-Watcher/commit/8490782cea7e9012d73312290340b54fa2f788fa))
+* privacy/delete on reply keyboard (4th row) ([5d5c5da](https://github.com/devAsmodeus/Charger-Watcher/commit/5d5c5da7494e070083cd585e764d70921ebc7ad1))
+* quiet hours per user (presets + delayed delivery) ([5d47ddc](https://github.com/devAsmodeus/Charger-Watcher/commit/5d47ddc273b0ec342ded5c7c76f2c2cf40e06f17))
+* referral program with reverse-on-refund ([5cbbc89](https://github.com/devAsmodeus/Charger-Watcher/commit/5cbbc895a614d64e7e0f0722ce15d322d8c3ff05))
+
+
+### Bug Fixes
+
+* stale-claim reaper for notification_log ([4f42b97](https://github.com/devAsmodeus/Charger-Watcher/commit/4f42b97c89ef31111beffe283dcb0dc16895c954))
+
+
+### Documentation
+
+* mini-app map plan synthesized from parallel research ([694c46a](https://github.com/devAsmodeus/Charger-Watcher/commit/694c46a47674bbb24af6e6a7d1fd80182fb9ea0c))
+
 ## [0.1.1](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.1.0...v0.1.1) (2026-05-11)
 
 
