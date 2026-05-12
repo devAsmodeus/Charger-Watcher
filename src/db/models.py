@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from datetime import datetime  # noqa: TC003 — SQLAlchemy резолвит Mapped[datetime] в рантайме
+from datetime import datetime, time  # noqa: TC003 — SQLAlchemy резолвит Mapped в рантайме
 from enum import StrEnum
 
 from sqlalchemy import (
@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     String,
+    Time,
     UniqueConstraint,
     func,
 )
@@ -37,6 +38,13 @@ class User(Base):
     paid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Тихие часы — окно «не беспокоить». Оба NULL = выключено.
+    # Notifier откладывает доставку до выхода из окна. tz — IANA.
+    quiet_from: Mapped[time | None] = mapped_column(Time, default=None)
+    quiet_to: Mapped[time | None] = mapped_column(Time, default=None)
+    tz: Mapped[str] = mapped_column(
+        String(64), default="Europe/Minsk", server_default="Europe/Minsk", nullable=False
     )
 
     subscriptions: Mapped[list[Subscription]] = relationship(

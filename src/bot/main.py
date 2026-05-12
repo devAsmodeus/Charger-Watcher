@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import html
 import signal
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 import orjson
 import redis.asyncio as aioredis
@@ -32,6 +32,7 @@ from bot.notifier import Notifier, tier_reaper
 from bot.onboarding import (
     BTN_FIND,
     BTN_LIST,
+    BTN_SETTINGS,
     BTN_TIER,
     GREETING_NEW,
     GREETING_RETURNING,
@@ -814,6 +815,93 @@ async def on_btn_tier(message: Message) -> None:
     if message.from_user is None:
         return
     await _send_tier(message, message.from_user.id)
+
+
+# ---------- settings (quiet hours) ----------
+
+# Пресеты тихих часов: (label, from_hour, to_hour). Окно через полночь
+# поддерживается — Notifier разруливает (см. quiet_hours.in_quiet_window).
+_QH_PRESETS: list[tuple[str, int, int]] = [
+    ("22:00 – 08:00", 22, 8),
+    ("23:00 – 07:00", 23, 7),
+    ("00:00 – 07:00", 0, 7),
+]
+
+
+def _fmt_qh(user: User) -> str:
+    if user.quiet_from is None or user.quiet_to is None:
+        return "выключены"
+    return f"{user.quiet_from:%H:%M} – {user.quiet_to:%H:%M} ({user.tz})"
+
+
+def _qh_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"qh:{a}:{b}")]
+        for label, a, b in _QH_PRESETS
+    ]
+    rows.append([InlineKeyboardButton(text="🔕 Без тихих часов", callback_data="qh:off")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(F.text == BTN_SETTINGS)
+async def on_btn_settings(message: Message) -> None:
+    if message.from_user is None:
+        return
+    user = await ensure_user(message.from_user.id)
+    text = (
+        "<b>⚙️ Настройки</b>\n\n"
+        f"🌙 Тихие часы: <b>{_fmt_qh(user)}</b>\n\n"
+        "Выбери пресет — уведомления внутри окна откладываются до выхода:"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=_qh_kb())
+
+
+@dp.callback_query(F.data.startswith("qh:"))
+async def on_qh_callback(cb: CallbackQuery) -> None:
+    """Применить пресет тихих часов или выключить.
+
+    callback_data: `qh:<from>:<to>` или `qh:off`.
+    """
+    if cb.from_user is None or cb.data is None or cb.message is None:
+        return
+    parts = cb.data.split(":")
+    new_from: time | None = None
+    new_to: time | None = None
+    if parts == ["qh", "off"]:
+        pass  # both None
+    elif len(parts) == 3:
+        try:
+            a, b = int(parts[1]), int(parts[2])
+        except ValueError:
+            await cb.answer("Плохой пресет")
+            return
+        if not (0 <= a <= 23 and 0 <= b <= 23):
+            await cb.answer("Плохой пресет")
+            return
+        new_from, new_to = time(a, 0), time(b, 0)
+    else:
+        await cb.answer("Плохой формат")
+        return
+
+    async with SessionLocal() as s:
+        user = await s.get(User, cb.from_user.id)
+        if user is None:
+            await cb.answer("Юзер не найден — /start")
+            return
+        user.quiet_from = new_from
+        user.quiet_to = new_to
+        await s.commit()
+        # Re-read для красивого фоллбэк-текста.
+        await s.refresh(user)
+
+    await cb.answer("Сохранено")
+    await cb.message.edit_text(
+        "<b>⚙️ Настройки</b>\n\n"
+        f"🌙 Тихие часы: <b>{_fmt_qh(user)}</b>\n\n"
+        "Можешь сменить пресет:",
+        parse_mode="HTML",
+        reply_markup=_qh_kb(),
+    )
 
 
 # ---------- admin ----------

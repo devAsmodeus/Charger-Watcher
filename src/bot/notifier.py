@@ -45,6 +45,7 @@ import contextlib
 import html
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import orjson
 import redis.asyncio as aioredis
@@ -82,6 +83,35 @@ NOTIFIER_CONSUMER = "notifier-1"
 
 def _status_icon(status: str | None) -> str:
     return {"AVAILABLE": "🟢", "FULLY_USED": "🔴", "UNAVAILABLE": "⚪"}.get(status or "", "❔")
+
+
+def _quiet_until_utc(user: User, now_utc: datetime) -> datetime | None:
+    """Если сейчас в окне тихих часов — момент выхода в UTC. Иначе None.
+
+    Поддерживается окно через полночь (`quiet_from > quiet_to`). Если оба
+    поля NULL или равны — тихих часов нет.
+    """
+    if user.quiet_from is None or user.quiet_to is None:
+        return None
+    qf, qt = user.quiet_from, user.quiet_to
+    if qf == qt:
+        return None  # пустое окно
+    try:
+        tz = ZoneInfo(user.tz or "Europe/Minsk")
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("Europe/Minsk")
+    now_local = now_utc.astimezone(tz)
+    cur_t = now_local.time()
+    wraps = qf > qt
+    in_window = (cur_t >= qf or cur_t < qt) if wraps else (qf <= cur_t < qt)
+    if not in_window:
+        return None
+    candidate = now_local.replace(
+        hour=qt.hour, minute=qt.minute, second=0, microsecond=0
+    )
+    if candidate <= now_local:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(UTC)
 
 
 def _format_alert(event: dict) -> str:
@@ -357,8 +387,11 @@ class Notifier:
             set(raw_free) if isinstance(raw_free, list) else set()
         )
 
-        paid_ready: list[tuple[int, int]] = []  # (tg_id, sub_id)
-        free_ready: list[tuple[int, int]] = []
+        paid_now: list[tuple[int, int]] = []  # (tg_id, sub_id), send immediately
+        free_now: list[tuple[int, int]] = []  # batched free-tier delay
+        # Per-user deferrals — для тех, кто сейчас в тихих часах. Не батчатся,
+        # т.к. у каждого юзера свой deliver_at = его quiet_to.
+        deferred: list[tuple[int, int, int]] = []  # (tg_id, sub_id, deliver_ts)
         for sub, user in subs:
             # Фильтр по типу коннектора — только если sub его задал И poller
             # знает что там сейчас свободно.
@@ -374,23 +407,36 @@ class Notifier:
                 tier = Tier.FREE.value
             if not await self._claim_slot(sub.id, loc_id, event_epoch):
                 continue
+            quiet_until = _quiet_until_utc(user, now)
+            if quiet_until is not None:
+                # В тихих часах — defer до выхода из окна. Для free также
+                # учитываем стандартную задержку: deliver = max(quiet_to, now+delay).
+                target = quiet_until
+                if tier == Tier.FREE.value:
+                    free_floor = now + timedelta(
+                        seconds=self.settings.free_tier_notify_delay_sec
+                    )
+                    if free_floor > target:
+                        target = free_floor
+                deferred.append((user.tg_id, sub.id, int(target.timestamp())))
+                continue
             if tier == Tier.PAID.value:
-                paid_ready.append((user.tg_id, sub.id))
+                paid_now.append((user.tg_id, sub.id))
             else:
-                free_ready.append((user.tg_id, sub.id))
+                free_now.append((user.tg_id, sub.id))
 
         # paid → send now (commit cooldown only on success)
-        for tg_id, sub_id in paid_ready:
+        for tg_id, sub_id in paid_now:
             await self._send_with_slot(
                 tg_id, sub_id, loc_id, event_epoch, text, location_name
             )
 
         # free → schedule via Redis ZSET; the slot stays "claimed" until the
         # delayed_worker either delivers (commit) or cancels/fails (release).
-        if free_ready:
+        if free_now:
             delay_ts = int(now.timestamp()) + self.settings.free_tier_notify_delay_sec
             payload = {
-                "tg_ids_subs": free_ready,
+                "tg_ids_subs": free_now,
                 "text": text,
                 "location_id": loc_id,
                 "location_name": location_name,
@@ -398,6 +444,20 @@ class Notifier:
             }
             await self.redis.zadd(
                 DELAYED_ZSET, {orjson.dumps(payload).decode(): delay_ts}
+            )
+
+        # quiet-hour-deferred users: per-user ZSET entries with own deliver_ts.
+        # Не батчим, т.к. у каждого свой выход из тихих часов.
+        for tg_id, sub_id, deliver_ts in deferred:
+            payload = {
+                "tg_ids_subs": [(tg_id, sub_id)],
+                "text": text,
+                "location_id": loc_id,
+                "location_name": location_name,
+                "event_epoch": event_epoch,
+            }
+            await self.redis.zadd(
+                DELAYED_ZSET, {orjson.dumps(payload).decode(): deliver_ts}
             )
 
     # -------- delayed worker --------
