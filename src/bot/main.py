@@ -1009,7 +1009,8 @@ async def on_btn_settings(message: Message) -> None:
     text = (
         "<b>⚙️ Настройки</b>\n\n"
         f"🌙 Тихие часы: <b>{_fmt_qh(user)}</b>\n\n"
-        "Выбери пресет — уведомления внутри окна откладываются до выхода:"
+        "В выбранное окно уведомления приходят без звука и вибрации — "
+        "не разбудят. Хронологию увидишь утром."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=_qh_kb())
 
