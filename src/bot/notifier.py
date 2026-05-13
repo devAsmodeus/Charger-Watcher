@@ -160,11 +160,16 @@ class Notifier:
         text: str,
         keyboard: InlineKeyboardMarkup | None,
         parse_mode: str | None = "HTML",
+        silent: bool = False,
     ) -> bool:
         async with self._limiter:
             try:
                 await self.bot.send_message(
-                    tg_id, text, parse_mode=parse_mode, reply_markup=keyboard
+                    tg_id,
+                    text,
+                    parse_mode=parse_mode,
+                    reply_markup=keyboard,
+                    disable_notification=silent,
                 )
                 return True
             except TelegramRetryAfter as e:
@@ -172,7 +177,11 @@ class Notifier:
                 await asyncio.sleep(e.retry_after + 1)
                 try:
                     await self.bot.send_message(
-                        tg_id, text, parse_mode=parse_mode, reply_markup=keyboard
+                        tg_id,
+                        text,
+                        parse_mode=parse_mode,
+                        reply_markup=keyboard,
+                        disable_notification=silent,
                     )
                     return True
                 except Exception as e2:  # noqa: BLE001
@@ -286,6 +295,7 @@ class Notifier:
         event_epoch: int,
         text: str,
         location_name: str,
+        silent: bool = False,
     ) -> bool:
         """Send + book-keep the cooldown slot atomically wrt failure.
 
@@ -293,8 +303,12 @@ class Notifier:
         инкремент notify_count и проверка квоты (если исчерпана — sub
         удаляется и шлётся пуш «подпишись заново»).
         On failure: DELETE the claim row so the next event isn't blocked.
+
+        ``silent`` пробрасывается в Telegram `disable_notification` — нужно
+        для тихих часов юзера: сообщение всё равно приходит в реальном
+        времени, но без звука/вибрации.
         """
-        ok = await self._send(tg_id, text, _unsub_keyboard(sub_id))
+        ok = await self._send(tg_id, text, _unsub_keyboard(sub_id), silent=silent)
         if not ok:
             await self._release_slot(sub_id, loc_id, event_epoch)
             return False
@@ -387,11 +401,13 @@ class Notifier:
             set(raw_free) if isinstance(raw_free, list) else set()
         )
 
-        paid_now: list[tuple[int, int]] = []  # (tg_id, sub_id), send immediately
-        free_now: list[tuple[int, int]] = []  # batched free-tier delay
-        # Per-user deferrals — для тех, кто сейчас в тихих часах. Не батчатся,
-        # т.к. у каждого юзера свой deliver_at = его quiet_to.
-        deferred: list[tuple[int, int, int]] = []  # (tg_id, sub_id, deliver_ts)
+        # (tg_id, sub_id, silent) — silent=True значит «сейчас тихие часы»,
+        # шлём с disable_notification (без звука/вибрации). НЕ откладываем
+        # доставку — push приходит сразу, просто беззвучно.
+        paid_now: list[tuple[int, int, bool]] = []
+        # Free идут в delayed-queue с обычной задержкой; silent определяется
+        # уже при доставке (на тот момент юзер мог войти/выйти из окна).
+        free_queue: list[tuple[int, int]] = []
         for sub, user in subs:
             # Фильтр по типу коннектора — только если sub его задал И poller
             # знает что там сейчас свободно.
@@ -407,36 +423,27 @@ class Notifier:
                 tier = Tier.FREE.value
             if not await self._claim_slot(sub.id, loc_id, event_epoch):
                 continue
-            quiet_until = _quiet_until_utc(user, now)
-            if quiet_until is not None:
-                # В тихих часах — defer до выхода из окна. Для free также
-                # учитываем стандартную задержку: deliver = max(quiet_to, now+delay).
-                target = quiet_until
-                if tier == Tier.FREE.value:
-                    free_floor = now + timedelta(
-                        seconds=self.settings.free_tier_notify_delay_sec
-                    )
-                    if free_floor > target:
-                        target = free_floor
-                deferred.append((user.tg_id, sub.id, int(target.timestamp())))
-                continue
             if tier == Tier.PAID.value:
-                paid_now.append((user.tg_id, sub.id))
+                silent = _quiet_until_utc(user, now) is not None
+                paid_now.append((user.tg_id, sub.id, silent))
             else:
-                free_now.append((user.tg_id, sub.id))
+                free_queue.append((user.tg_id, sub.id))
 
-        # paid → send now (commit cooldown only on success)
-        for tg_id, sub_id in paid_now:
+        # paid → send now (silent если сейчас тихие часы у юзера).
+        for tg_id, sub_id, silent in paid_now:
             await self._send_with_slot(
-                tg_id, sub_id, loc_id, event_epoch, text, location_name
+                tg_id, sub_id, loc_id, event_epoch, text, location_name, silent=silent
             )
 
         # free → schedule via Redis ZSET; the slot stays "claimed" until the
         # delayed_worker either delivers (commit) or cancels/fails (release).
-        if free_now:
+        # Silent-флаг считаем в момент доставки — на тот момент окно тихих
+        # часов могло закрыться (например, событие случилось в 06:58, окно
+        # 23-07, free_delay=2мин → доставка в 07:00 уже громкая).
+        if free_queue:
             delay_ts = int(now.timestamp()) + self.settings.free_tier_notify_delay_sec
             payload = {
-                "tg_ids_subs": free_now,
+                "tg_ids_subs": free_queue,
                 "text": text,
                 "location_id": loc_id,
                 "location_name": location_name,
@@ -444,20 +451,6 @@ class Notifier:
             }
             await self.redis.zadd(
                 DELAYED_ZSET, {orjson.dumps(payload).decode(): delay_ts}
-            )
-
-        # quiet-hour-deferred users: per-user ZSET entries with own deliver_ts.
-        # Не батчим, т.к. у каждого свой выход из тихих часов.
-        for tg_id, sub_id, deliver_ts in deferred:
-            payload = {
-                "tg_ids_subs": [(tg_id, sub_id)],
-                "text": text,
-                "location_id": loc_id,
-                "location_name": location_name,
-                "event_epoch": event_epoch,
-            }
-            await self.redis.zadd(
-                DELAYED_ZSET, {orjson.dumps(payload).decode(): deliver_ts}
             )
 
     # -------- delayed worker --------
@@ -498,9 +491,50 @@ class Notifier:
 
                 text = payload["text"]
                 location_name = payload.get("location_name") or "локация"
+                cutoff = datetime.now(UTC) - timedelta(
+                    seconds=self.settings.notify_cooldown_sec
+                )
                 for tg_id, sub_id in payload["tg_ids_subs"]:
+                    # Перепроверяем cooldown в момент доставки: пока запись
+                    # лежала в delayed-queue, могло прилететь и доставиться
+                    # другое событие по той же подписке — тогда не дублируем.
+                    async with SessionLocal() as s:
+                        sub = await s.get(Subscription, sub_id)
+                        if sub is None:
+                            # Подписка снята (квота исчерпана / unsubscribe /
+                            # delete_me); cascade FK уже снёс наш claim.
+                            log.info(
+                                "delayed_skip_sub_gone", sub=sub_id, loc=loc_id
+                            )
+                            continue
+                        recent = (
+                            await s.execute(
+                                select(NotificationLog.id)
+                                .where(
+                                    and_(
+                                        NotificationLog.subscription_id == sub_id,
+                                        NotificationLog.location_id == loc_id,
+                                        NotificationLog.delivered_at.is_not(None),
+                                        NotificationLog.delivered_at >= cutoff,
+                                    )
+                                )
+                                .limit(1)
+                            )
+                        ).first()
+                        user = await s.get(User, tg_id)
+                    if recent is not None:
+                        log.info(
+                            "delayed_skip_cooldown", sub=sub_id, loc=loc_id
+                        )
+                        await self._release_slot(sub_id, loc_id, event_epoch)
+                        continue
+                    silent = (
+                        user is not None
+                        and _quiet_until_utc(user, datetime.now(UTC)) is not None
+                    )
                     await self._send_with_slot(
-                        tg_id, sub_id, loc_id, event_epoch, text, location_name
+                        tg_id, sub_id, loc_id, event_epoch, text, location_name,
+                        silent=silent,
                     )
 
             with contextlib.suppress(TimeoutError):
