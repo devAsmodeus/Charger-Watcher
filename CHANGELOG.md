@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.2.1...v0.2.2) (2026-05-13)
+
+
+### Bug Fixes
+
+* copy audit findings — operator labels, paths, grammar, settings ([06ab925](https://github.com/devAsmodeus/Charger-Watcher/commit/06ab925322a5ebb8475d93a18e6c05a98ddce0d7))
+
 ## [0.2.1](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.2.0...v0.2.1) (2026-05-13)
 
 
