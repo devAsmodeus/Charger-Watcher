@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.2.0...v0.2.1) (2026-05-13)
+
+
+### Bug Fixes
+
+* quiet hours = silent push, not deferred delivery ([1480532](https://github.com/devAsmodeus/Charger-Watcher/commit/148053290ebfae5117aa3105bf7b2e9c1e666c47))
+
 ## [0.2.0](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.1.1...v0.2.0) (2026-05-12)
 
 
