@@ -20,6 +20,22 @@ BTN_REFERRAL = "🎁 Пригласить друга"
 BTN_PRIVACY = "📜 Политика"
 BTN_DELETE = "🗑 Удалить данные"
 
+# Человеко-читаемые имена операторов. В БД хранится Operator.value
+# (`central`, `evika`, `battery-fly`) — это internal-id из api-схемы.
+# В UI/уведомлениях показываем брендовые имена. Если в БД появится
+# новый оператор, fallback'имся на сам value.
+OPERATOR_LABELS: dict[str, str] = {
+    "central": "Маланка",
+    "evika": "Evika",
+    "battery-fly": "Battery-fly",
+}
+
+
+def operator_label(value: str | None) -> str:
+    if not value:
+        return "—"
+    return OPERATOR_LABELS.get(value, value)
+
 GREETING_NEW = (
     "👋 Я слежу за свободными ЭЗС в Беларуси "
     "(сети Маланка, Evika, Battery-fly).\n"

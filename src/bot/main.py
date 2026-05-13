@@ -5,6 +5,7 @@ import contextlib
 import html
 import signal
 from datetime import UTC, datetime, time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import orjson
 import redis.asyncio as aioredis
@@ -42,6 +43,7 @@ from bot.onboarding import (
     about_kb,
     about_text,
     main_reply_kb,
+    operator_label,
 )
 from config import get_settings
 from db.models import (
@@ -307,14 +309,17 @@ async def _send_privacy(message: Message) -> None:
     await message.answer(
         "<b>Политика конфиденциальности</b>\n\n"
         "Сервис хранит минимум данных:\n"
-        "• Ваш Telegram ID (без имени/телефона)\n"
-        "• Список ваших подписок (id локации)\n"
+        "• Telegram ID (без имени/телефона)\n"
+        "• Список подписок (id локации, тип коннектора, лимит)\n"
+        "• Тариф и срок действия paid\n"
+        "• Тихие часы и часовой пояс (если задавал)\n"
+        "• Реферальные связи (кого пригласил / кто пригласил)\n"
         "• Лог отправленных уведомлений (для дедупа)\n\n"
         "Данные не передаются третьим лицам и используются только для рассылки уведомлений. "
-        "Удалить все свои данные можно через <b>/about → 🗑 Удалить данные</b> "
+        "Удалить все свои данные можно кнопкой <b>🗑 Удалить данные</b> в меню под полем ввода "
         "или командой <code>/delete_me</code> — действие необратимо.\n\n"
         "Сервис не является официальным от оператора зарядных станций. "
-        "Вопросы и жалобы — через /about → контакты автора.",
+        "Вопросы и жалобы — контакты автора в /about.",
         parse_mode="HTML",
     )
 
@@ -331,7 +336,7 @@ async def _send_delete_confirm(message: Message) -> None:
         "<b>Снесётся:</b>\n"
         "• все подписки и история уведомлений\n"
         "• тариф и тихие часы\n"
-        "• реферальные связи (если ты кого-то приглашал)\n\n"
+        "• реферальные связи (и кого ты пригласил, и кто пригласил тебя)\n\n"
         "<b>Останется:</b>\n"
         "• обезличенные платёжные записи (без привязки к тебе)\n\n"
         "Если у тебя сейчас paid — статус сгорит, оплату обратно не вернуть.\n"
@@ -385,7 +390,10 @@ async def _send_nearby_prompt(message: Message) -> None:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await message.answer("Пришли геолокацию — найду 10 ближайших станций.", reply_markup=kb)
+    await message.answer(
+        "Пришли геолокацию — покажу до 10 ближайших станций в радиусе 5 км.",
+        reply_markup=kb,
+    )
 
 
 @dp.message(Command("nearby"))
@@ -413,7 +421,7 @@ async def on_location(message: Message) -> None:
         text = (
             f"{_status_icon(loc.last_status)} <b>{html.escape(loc.name)}</b>\n"
             f"{html.escape(loc.address)}\n"
-            f"📏 {h.distance_km:.2f} км · сеть: {html.escape(loc.operator)}"
+            f"📏 {h.distance_km:.2f} км · Сеть: {html.escape(operator_label(loc.operator))}"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=_subscribe_kb(loc.id))
         # Telegram per-chat бёрстит ~5 msg/s до FloodWait. 10 карточек подряд
@@ -445,7 +453,7 @@ async def cmd_find(message: Message, command: CommandObject) -> None:
         text = (
             f"{_status_icon(loc.last_status)} <b>{html.escape(loc.name)}</b>\n"
             f"{html.escape(loc.address)}\n"
-            f"сеть: {html.escape(loc.operator)}"
+            f"Сеть: {html.escape(operator_label(loc.operator))}"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=_subscribe_kb(loc.id))
         if i < len(rows) - 1:
@@ -462,12 +470,29 @@ async def _send_list(message: Message, tg_id: int) -> None:
             )
         ).all()
     if not rows:
-        await message.answer("У тебя пока нет подписок. /nearby или /find + 🔔.")
+        await message.answer(
+            "У тебя пока нет подписок. Тапни «📍 Рядом» или «🔎 По адресу» "
+            "и потом 🔔.",
+        )
         return
-    lines = [
-        f"• {(loc.name if loc else 'geo')} — {(loc.last_status if loc and loc.last_status else 'статус неизвестен')}"
-        for sub, loc in rows
-    ]
+    lines: list[str] = []
+    for sub, loc in rows:
+        name = html.escape(loc.name) if loc else "geo"
+        status_part = (
+            f"{_status_icon(loc.last_status)} {html.escape(loc.last_status)}"
+            if loc and loc.last_status
+            else "❔ статус обновится при первом сигнале"
+        )
+        connector = html.escape(sub.connector_type) if sub.connector_type else "любой"
+        if sub.notify_limit is None:
+            quota = "∞"
+        else:
+            left = max(0, sub.notify_limit - sub.notify_count)
+            quota = f"осталось {left}"
+        lines.append(
+            f"• <b>{name}</b> — {status_part}\n"
+            f"  🔌 {connector} · 🔔 {quota}"
+        )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -479,7 +504,11 @@ async def _send_list(message: Message, tg_id: int) -> None:
             for sub, loc in rows
         ]
     )
-    await message.answer("Твои подписки:\n" + "\n".join(lines), reply_markup=kb)
+    await message.answer(
+        "<b>Твои подписки:</b>\n" + "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
 
 
 @dp.message(Command("list"))
@@ -615,7 +644,20 @@ async def on_wlim_callback(cb: CallbackQuery) -> None:
             await s.rollback()
             await cb.answer("Уже подписан на эту локацию.")
             return
-    limit_str = "∞ (всегда)" if notify_limit is None else f"{notify_limit} раз"
+    # Подбираем правильную форму «уведомление/уведомления/уведомлений»
+    # под выбранный лимит. Совпадает с LIMIT_OPTIONS — там уже правильно.
+    if notify_limit is None:
+        limit_str = "∞ (всегда)"
+    else:
+        n_mod_10 = notify_limit % 10
+        n_mod_100 = notify_limit % 100
+        if n_mod_10 == 1 and n_mod_100 != 11:
+            word = "уведомление"
+        elif 2 <= n_mod_10 <= 4 and not 12 <= n_mod_100 <= 14:
+            word = "уведомления"
+        else:
+            word = "уведомлений"
+        limit_str = f"{notify_limit} {word}"
     type_str = connector_type or "любой"
     await cb.answer("Подписка оформлена ✔")
     await cb.message.edit_text(
@@ -699,9 +741,18 @@ async def _send_tier(message: Message, tg_id: int) -> None:
         now = datetime.now(UTC)
         delta = user.paid_until - now
         days_left = max(0, delta.days)
+        # Дата в часовом поясе юзера (тот же, что для тихих часов), не в UTC.
+        try:
+            tz = ZoneInfo(user.tz or "Europe/Minsk")
+        except ZoneInfoNotFoundError:
+            tz = ZoneInfo("Europe/Minsk")
+        local_until = user.paid_until.astimezone(tz)
+        days_part = (
+            f"осталось < 1 дн." if days_left == 0 else f"осталось {days_left} дн."
+        )
         rows.append(
-            f"Действует до: <b>{user.paid_until:%d.%m.%Y, %H:%M}</b> UTC "
-            f"(осталось {days_left} дн.)"
+            f"Действует до: <b>{local_until:%d.%m.%Y, %H:%M}</b> ({user.tz}) "
+            f"· {days_part}"
         )
     rows.append(f"Подписки: <b>{used} / {limit}</b>")
     if tier == Tier.FREE.value:
@@ -929,7 +980,7 @@ async def on_paid(message: Message) -> None:
             await message.bot.send_message(
                 reward_inviter,
                 f"🎁 Друг по твоей ссылке оплатил paid! "
-                f"+{settings.referral_reward_days} дней начислены.",
+                f"+{settings.referral_reward_days} дней начислено.",
             )
         except Exception as e:  # noqa: BLE001
             log.warning(
@@ -1006,11 +1057,20 @@ async def on_btn_settings(message: Message) -> None:
     if message.from_user is None:
         return
     user = await ensure_user(message.from_user.id)
+    if user.quiet_from is None or user.quiet_to is None:
+        explainer = (
+            "Включи окно — внутри него уведомления будут приходить "
+            "без звука и вибрации (не разбудят), но появятся в шторке сразу."
+        )
+    else:
+        explainer = (
+            "В выбранное окно уведомления приходят без звука и вибрации — "
+            "не разбудят, но появятся в шторке сразу, в реальном времени."
+        )
     text = (
         "<b>⚙️ Настройки</b>\n\n"
         f"🌙 Тихие часы: <b>{_fmt_qh(user)}</b>\n\n"
-        "В выбранное окно уведомления приходят без звука и вибрации — "
-        "не разбудят. Хронологию увидишь утром."
+        f"{explainer}"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=_qh_kb())
 
@@ -1206,7 +1266,11 @@ async def cmd_refund(message: Message, command: CommandObject) -> None:
     async with SessionLocal() as s:
         user = await s.get(User, target_tg)
         if user is None:
-            await message.answer(f"Юзер <code>{target_tg}</code> не найден.", parse_mode="HTML")
+            await message.answer(
+                f"Юзер <code>{target_tg}</code> в базе не зарегистрирован "
+                "(/start не нажимал или уже сделал /delete_me).",
+                parse_mode="HTML",
+            )
             return
         payment = (
             await s.execute(
@@ -1303,7 +1367,7 @@ async def cmd_refund(message: Message, command: CommandObject) -> None:
             await message.bot.send_message(
                 reward_reversed_for,
                 f"⚠️ Платёж по твоей реферальной ссылке отменён. "
-                f"−{settings.referral_reward_days} дней paid списаны.",
+                f"−{settings.referral_reward_days} дней paid списано.",
             )
         except Exception as e:  # noqa: BLE001
             log.warning(
@@ -1327,8 +1391,8 @@ async def cmd_refund(message: Message, command: CommandObject) -> None:
         log.warning("refund_notify_failed", target=target_tg, err=str(e))
 
     await message.answer(
-        f"✔ Refund <b>{payment.amount_stars} ⭐</b> → <code>{target_tg}</code>\n"
-        f"Subs удалено: {len(to_delete)}",
+        f"✔ Возврат <b>{payment.amount_stars} ⭐</b> → <code>{target_tg}</code>\n"
+        f"Подписок удалено: {len(to_delete)}",
         parse_mode="HTML",
     )
 

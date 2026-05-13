@@ -56,6 +56,7 @@ from aiolimiter import AsyncLimiter
 from sqlalchemy import and_, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from bot.onboarding import operator_label
 from config import get_settings
 from db.models import (
     NotificationLog,
@@ -120,10 +121,13 @@ def _format_alert(event: dict) -> str:
     Markdown ломается на любой `_`/`*`/`[` в адресе, и тогда send падает,
     cooldown release-ится, на следующем переходе всё повторяется — silent
     loss для конкретной локации навсегда. HTML escape отрезает этот класс.
+
+    `operator_label` маппит internal-id (`central`/`evika`/`battery-fly`)
+    в брендовое имя (`Маланка`/`Evika`/`Battery-fly`).
     """
     name = html.escape(str(event.get("name", "")))
     address = html.escape(str(event.get("address", "")))
-    operator = html.escape(str(event.get("operator", "")))
+    operator = html.escape(operator_label(event.get("operator")))
     return (
         f"🟢 Освободилась: <b>{name}</b>\n"
         f"{address}\n"
