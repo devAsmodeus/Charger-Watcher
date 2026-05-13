@@ -748,7 +748,7 @@ async def _send_tier(message: Message, tg_id: int) -> None:
             tz = ZoneInfo("Europe/Minsk")
         local_until = user.paid_until.astimezone(tz)
         days_part = (
-            f"осталось < 1 дн." if days_left == 0 else f"осталось {days_left} дн."
+            "осталось < 1 дн." if days_left == 0 else f"осталось {days_left} дн."
         )
         rows.append(
             f"Действует до: <b>{local_until:%d.%m.%Y, %H:%M}</b> ({user.tz}) "
