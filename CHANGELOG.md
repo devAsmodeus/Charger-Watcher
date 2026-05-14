@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.2.2...v0.3.0) (2026-05-14)
+
+
+### Features
+
+* show freed connector type in 'Освободилась' push ([424f363](https://github.com/devAsmodeus/Charger-Watcher/commit/424f3635077e78aa8006f4523e44f1c49b9ec773))
+* show freed connector type(s) in 'Освободилась' alert ([14774fd](https://github.com/devAsmodeus/Charger-Watcher/commit/14774fd24b28d2308834cf643990ea332ef49002))
+
 ## [0.2.2](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.2.1...v0.2.2) (2026-05-13)
 
 
