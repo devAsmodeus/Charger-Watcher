@@ -124,13 +124,25 @@ def _format_alert(event: dict) -> str:
 
     `operator_label` маппит internal-id (`central`/`evika`/`battery-fly`)
     в брендовое имя (`Маланка`/`Evika`/`Battery-fly`).
+
+    `free_connector_types` — список ярлыков коннекторов, которые освободились
+    в этом конкретном событии (например `["Chademo"]` или
+    `["Розетка Type2", "Пистолет Type2"]`). Пустой список = poller не смог
+    получить detail, типы неизвестны — строку «🔌» пропускаем.
     """
     name = html.escape(str(event.get("name", "")))
     address = html.escape(str(event.get("address", "")))
     operator = html.escape(operator_label(event.get("operator")))
+    raw_free = event.get("free_connector_types") or []
+    connector_line = ""
+    if isinstance(raw_free, list) and raw_free:
+        types = ", ".join(html.escape(str(t)) for t in raw_free if t)
+        if types:
+            connector_line = f"🔌 {types}\n"
     return (
         f"🟢 Освободилась: <b>{name}</b>\n"
         f"{address}\n"
+        f"{connector_line}"
         f"Сеть: {operator} · 📍 {event['lat']:.5f}, {event['lon']:.5f}"
     )
 
