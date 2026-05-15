@@ -653,7 +653,12 @@ async def _periodic(stop: asyncio.Event, interval: float, fn) -> None:
 
 async def _runner() -> None:
     settings = get_settings()
-    setup_logging(settings.log_level)
+    setup_logging(
+        settings.log_level,
+        errors_file=settings.log_errors_file or None,
+        max_bytes=settings.log_errors_max_bytes,
+        backups=settings.log_errors_backups,
+    )
     log.info(
         "poller_start",
         interval_sec=settings.poll_interval_sec,

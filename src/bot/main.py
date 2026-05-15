@@ -1431,7 +1431,12 @@ async def fallback(message: Message) -> None:
 
 async def _runner() -> None:
     settings = get_settings()
-    setup_logging(settings.log_level)
+    setup_logging(
+        settings.log_level,
+        errors_file=settings.log_errors_file or None,
+        max_bytes=settings.log_errors_max_bytes,
+        backups=settings.log_errors_backups,
+    )
     if not settings.tg_bot_token:
         raise RuntimeError("TG_BOT_TOKEN is not set")
     bot = Bot(settings.tg_bot_token)

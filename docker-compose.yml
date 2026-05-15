@@ -1,9 +1,20 @@
 name: charger-watcher
 
+# Ротация stdout-логов всех сервисов — без неё json-file драйвер docker'а
+# растёт без границ и съедает диск (Critical: видели уже на одном сервере).
+# 10MB × 5 файлов = до 50MB на сервис.
+x-logging: &default-logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    <<: *default-logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-charger}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-charger}
@@ -19,6 +30,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    <<: *default-logging
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -31,6 +43,13 @@ services:
     restart: unless-stopped
     command: python -m poller.main
     env_file: .env
+    <<: *default-logging
+    environment:
+      # WARNING+ дублируется в host-смонтированный logs/ как JSON-строки —
+      # для быстрого `tail`/`jq` без `docker compose logs`. См. CLAUDE.md.
+      LOG_ERRORS_FILE: /var/log/app/poller.errors.jsonl
+    volumes:
+      - ./logs:/var/log/app
     extra_hosts:
       - "${API_HOST:-_disabled}:${API_HOST_IP:-127.0.0.1}"
     depends_on:
@@ -46,6 +65,7 @@ services:
     image: qmcgaw/gluetun:latest
     container_name: charger-watcher-gluetun
     restart: unless-stopped
+    <<: *default-logging
     cap_add:
       - NET_ADMIN
     devices:
@@ -78,6 +98,11 @@ services:
     restart: unless-stopped
     command: python -m bot.main
     env_file: .env
+    <<: *default-logging
+    environment:
+      LOG_ERRORS_FILE: /var/log/app/bot.errors.jsonl
+    volumes:
+      - ./logs:/var/log/app
     network_mode: "service:gluetun"
     depends_on:
       gluetun:

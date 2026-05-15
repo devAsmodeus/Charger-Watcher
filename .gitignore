@@ -17,6 +17,10 @@ build/
 .claude/
 *.log
 
+# Persistent app logs (errors.jsonl + rotation) — host-mounted volume
+# /srv/charger-watcher/logs ← /var/log/app в контейнерах bot/poller.
+logs/
+
 # Secrets — VPN credentials, never commit
 vpn/
 
