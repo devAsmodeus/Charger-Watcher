@@ -30,7 +30,12 @@ EVENTS_STREAM = "charger:events"
 # heartbeat after a restart is treated as the baseline and any transition
 # that happened during downtime is silently lost — a missed notification.
 REST_PREV_HASH = "poller:rest:prev"  # field "<operator>:<external_id>" -> status
-SSE_FREE_HASH = "poller:sse:last_any_free"  # field "<device_number>" -> "1" / "0"
+# Per-device set of free connector type labels at last frame. JSON list[str].
+# Заменил предыдущий "<device>" -> "1"/"0" (any-free bool) — он коллапсировал
+# многоконнекторные транзишены в одно событие (свободный Type2 маскировал
+# освобождение Chademo). Теперь diff на set-уровне → событие на каждый
+# новый освободившийся тип.
+SSE_PREV_FREE_HASH = "poller:sse:prev_free"
 
 # Catalog of connector types per location (статика — типы железа). Bot
 # читает этот hash в wizard'е подписки чтобы построить keyboard выбора.
@@ -216,6 +221,14 @@ async def rest_diff_once(
             items = await client.list_locations(op)
         except Exception as e:
             log.warning("list_locations_failed", operator=op.value, err=str(e))
+            # Сохраняем baseline для упавшего оператора. Иначе save_rest_prev
+            # увидит отсутствие его ключей в new_state и HDEL'нет их из Redis
+            # → следующий успешный тик стартует с пустой prev, treat'ит ВСЁ
+            # как первое наблюдение (`old is None` → continue), и каждый
+            # transition, случившийся во время аутажа, теряется молча.
+            for key, status in prev.items():
+                if key[0] is op:
+                    new_state[key] = status
             continue
 
         ext_to_id = await upsert_locations(op, items)
@@ -251,6 +264,12 @@ async def rest_diff_once(
                     "from_status": old.value,
                     "to_status": item.status.value,
                     "became_available": item.status is LocationStatus.AVAILABLE,
+                    # REST API отдаёт только агрегированный LocationStatus —
+                    # connector-level granularity нет. Но transition в
+                    # AVAILABLE из FULLY_USED/UNAVAILABLE означает что ВСЕ
+                    # сейчас-свободные были до этого busy, т.е. для нас
+                    # transitioned == free_connector_types.
+                    "transitioned_connector_types": free_types,
                     "free_connector_types": free_types,
                     "name": item.name,
                     "address": item.address,
@@ -355,15 +374,21 @@ async def _sse_worker(
     log.info("sse_open", device=device_number, ext=external_id)
     # per-connector last seen OCPP status
     last: dict[int, str] = {}
-    # derived: is *any* connector of this device currently Available.
+    # Set of currently-free connector type LABELS (typeRu/typeEn).
     # Bootstrap from Redis so a station that was already free at restart
     # still fires when the next heartbeat differs from the persisted state.
-    last_any_free: bool | None = None
-    persisted = await redis.hget(SSE_FREE_HASH, str(device_number))
-    if persisted == "1":
-        last_any_free = True
-    elif persisted == "0":
-        last_any_free = False
+    # None = cold start, ещё не было ни одного frame'а с известным baseline.
+    prev_free_labels: set[str] | None = None
+    persisted = await redis.hget(SSE_PREV_FREE_HASH, str(device_number))
+    if persisted:
+        try:
+            loaded = orjson.loads(persisted)
+            if isinstance(loaded, list):
+                prev_free_labels = {str(x) for x in loaded if isinstance(x, str)}
+        except Exception:  # noqa: BLE001
+            # Кривой JSON — игнорируем, считаем cold start. На след frame
+            # сидим заново. Безопасно: cold start не публикует event'ы.
+            prev_free_labels = None
     # Один сидинг last_status в БД на жизнь воркера. Без этого central-
     # локации сидят с NULL в БД, пока не случится transition (а у subscribed
     # станций он редкий).
@@ -379,46 +404,59 @@ async def _sse_worker(
                 if not isinstance(status, str) or not isinstance(code, int):
                     continue
                 last[code] = status
-                any_free = any(s in FREE_OCPP_STATUSES for s in last.values())
+
+                # Текущий снимок: какие type-лейблы коннекторов свободны.
+                current_free_labels: set[str] = set()
+                for c, st in last.items():
+                    if st not in FREE_OCPP_STATUSES:
+                        continue
+                    label = connector_map.get(c)
+                    if label:
+                        current_free_labels.add(label)
+                any_free = bool(current_free_labels)
 
                 # Сид БД один раз за лайфтайм воркера. Делаем тут, а не
-                # в branch'е `last_any_free is None`, потому что на
-                # restart`е last_any_free уже взят из Redis — этой ветки
+                # в branch'е `prev_free_labels is None`, потому что на
+                # restart'е prev_free_labels уже взят из Redis — этой ветки
                 # не будет, и БД останется с NULL.
                 if not db_synced:
                     await _set_location_status(location_id, any_free)
                     db_synced = True
 
-                if last_any_free is None:
-                    last_any_free = any_free
-                    # Seed Redis on first frame so that across restarts we
-                    # always have a baseline to diff against.
+                if prev_free_labels is None:
+                    # Cold start: seed baseline и НИКАКОГО event'а — иначе
+                    # каждый рестарт поллера сыпал бы spurious «освободилось»
+                    # на каждую станцию что и так свободна.
+                    prev_free_labels = current_free_labels
                     await redis.hset(
-                        SSE_FREE_HASH, str(device_number), "1" if any_free else "0"
+                        SSE_PREV_FREE_HASH,
+                        str(device_number),
+                        orjson.dumps(sorted(current_free_labels)).decode(),
                     )
                     continue
-                if any_free == last_any_free:
+                if current_free_labels == prev_free_labels:
                     continue
 
-                last_any_free = any_free
-                # Persist the new baseline so a restart between this frame
-                # and the next one does not lose the transition signal.
+                # Diff: что СТАЛО свободно с прошлого кадра. Только эти типы
+                # инициируют «освободилось» — освобождение Chademo больше
+                # не маскируется уже-свободным Type2.
+                newly_free = current_free_labels - prev_free_labels
+                was_any_free = bool(prev_free_labels)
+                prev_free_labels = current_free_labels
                 await redis.hset(
-                    SSE_FREE_HASH, str(device_number), "1" if any_free else "0"
+                    SSE_PREV_FREE_HASH,
+                    str(device_number),
+                    orjson.dumps(sorted(current_free_labels)).decode(),
                 )
-                await _set_location_status(location_id, any_free)
-                if any_free:
-                    # location transitioned to having at least one free connector
+                # Aggregate any_free для UI флипнулся — обновляем
+                # Location.last_status. Внутри одного «есть свободные»
+                # состояния (Chademo был, теперь Type2 + Chademo) — нет.
+                if was_any_free != any_free:
+                    await _set_location_status(location_id, any_free)
+
+                if newly_free:
                     now = int(time.time())
-                    free_types: list[str] = []
-                    seen_types: set[str] = set()
-                    for c, st in last.items():
-                        if st not in FREE_OCPP_STATUSES:
-                            continue
-                        label = connector_map.get(c)
-                        if label and label not in seen_types:
-                            seen_types.add(label)
-                            free_types.append(label)
+                    transitioned = sorted(newly_free)
                     await publish_event(
                         redis,
                         {
@@ -426,10 +464,11 @@ async def _sse_worker(
                             "operator": Operator.MAIN.value,
                             "location_id": location_id,
                             "external_id": external_id,
-                            "from_status": "FULLY_USED",
+                            "from_status": "FULLY_USED" if not was_any_free else "AVAILABLE",
                             "to_status": "AVAILABLE",
                             "became_available": True,
-                            "free_connector_types": free_types,
+                            "transitioned_connector_types": transitioned,
+                            "free_connector_types": sorted(current_free_labels),
                             "name": name,
                             "address": address,
                             "lat": lat,
@@ -441,7 +480,7 @@ async def _sse_worker(
                         "sse_available",
                         device=device_number,
                         ext=external_id,
-                        connector=code,
+                        transitioned=transitioned,
                     )
         except asyncio.CancelledError:
             log.info("sse_cancelled", device=device_number)
@@ -528,6 +567,12 @@ class SseManager:
         stale = [dn for dn in self._workers if dn not in wanted]
         for dn in stale:
             self._workers[dn].cancel()
+            # Чистим persisted free-labels — без этого после удаления всех
+            # подписок на станцию запись в Redis остаётся, и если юзер
+            # подпишется заново на ту же станцию, первый frame нового
+            # воркера сравнится со СТАЛЫМ snapshot'ом → spurious «освободилось».
+            with contextlib.suppress(Exception):
+                await self._redis.hdel(SSE_PREV_FREE_HASH, str(dn))
             self._workers.pop(dn, None)
 
         if stale or wanted:
@@ -608,7 +653,12 @@ async def _periodic(stop: asyncio.Event, interval: float, fn) -> None:
 
 async def _runner() -> None:
     settings = get_settings()
-    setup_logging(settings.log_level)
+    setup_logging(
+        settings.log_level,
+        errors_file=settings.log_errors_file or None,
+        max_bytes=settings.log_errors_max_bytes,
+        backups=settings.log_errors_backups,
+    )
     log.info(
         "poller_start",
         interval_sec=settings.poll_interval_sec,

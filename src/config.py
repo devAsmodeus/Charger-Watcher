@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     referral_reward_days: int = Field(default=15, alias="REFERRAL_REWARD_DAYS")
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    # Ротируемый JSON-файл для уровней WARNING+ — отдельно от stdout, чтобы
+    # быстро искать «что упало за последние сутки» без `docker compose logs`.
+    # Пустая строка = отключено (по умолчанию вне docker). В compose-окружении
+    # подставляется bot.errors.jsonl / poller.errors.jsonl в смонтированный volume.
+    log_errors_file: str = Field(default="", alias="LOG_ERRORS_FILE")
+    log_errors_max_bytes: int = Field(default=5_000_000, alias="LOG_ERRORS_MAX_BYTES")
+    log_errors_backups: int = Field(default=5, alias="LOG_ERRORS_BACKUPS")
 
     # CSV of Telegram user ids with admin rights (/stats and future admin cmds).
     # Список парсим лениво в admin_ids_set() — pydantic не любит list[int] из env.

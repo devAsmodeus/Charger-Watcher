@@ -155,6 +155,19 @@ def _status_icon(status: str | None) -> str:
     return {"AVAILABLE": "🟢", "FULLY_USED": "🔴", "UNAVAILABLE": "⚪"}.get(status or "", "❔")
 
 
+# Русские лейблы для отображения в /list — без них юзеру предъявляется
+# `AVAILABLE / FULLY_USED / UNAVAILABLE` как есть.
+_STATUS_RU: dict[str, str] = {
+    "AVAILABLE": "свободна",
+    "FULLY_USED": "занята",
+    "UNAVAILABLE": "недоступна",
+}
+
+
+def _status_ru(status: str | None) -> str:
+    return _STATUS_RU.get(status or "", status or "неизвестно")
+
+
 def _subscribe_kb(location_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -479,7 +492,7 @@ async def _send_list(message: Message, tg_id: int) -> None:
     for sub, loc in rows:
         name = html.escape(loc.name) if loc else "geo"
         status_part = (
-            f"{_status_icon(loc.last_status)} {html.escape(loc.last_status)}"
+            f"{_status_icon(loc.last_status)} {_status_ru(loc.last_status)}"
             if loc and loc.last_status
             else "❔ статус обновится при первом сигнале"
         )
@@ -663,6 +676,16 @@ async def on_wlim_callback(cb: CallbackQuery) -> None:
     await cb.message.edit_text(
         f"✅ Подписан: {loc.name}\nКоннектор: {type_str}\nЛимит уведомлений: {limit_str}"
     )
+    # Если станция прямо сейчас уже свободна — отдельным сообщением сообщаем
+    # об этом юзеру. Без этой подсказки человек получал спустя ~10-60 сек
+    # обычное «🟢 Освободилась» (на ближайшем connector-transition) и читал
+    # его как «бот выдумал освобождение прямо в момент подписки». Теперь
+    # текущее состояние явно отделено от будущих transition-уведомлений.
+    if loc.last_status == "AVAILABLE":
+        await cb.message.answer(
+            "🟢 Сейчас уже свободна — можно ехать.\n"
+            "Когда занятый коннектор снова освободится, пришлю уведомление."
+        )
 
 
 @dp.callback_query(F.data.startswith("unsub:"))
@@ -1408,7 +1431,12 @@ async def fallback(message: Message) -> None:
 
 async def _runner() -> None:
     settings = get_settings()
-    setup_logging(settings.log_level)
+    setup_logging(
+        settings.log_level,
+        errors_file=settings.log_errors_file or None,
+        max_bytes=settings.log_errors_max_bytes,
+        backups=settings.log_errors_backups,
+    )
     if not settings.tg_bot_token:
         raise RuntimeError("TG_BOT_TOKEN is not set")
     bot = Bot(settings.tg_bot_token)
