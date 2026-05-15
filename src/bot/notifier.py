@@ -50,7 +50,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import orjson
 import redis.asyncio as aioredis
 import structlog
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiolimiter import AsyncLimiter
 from sqlalchemy import and_, delete, select, update
@@ -125,18 +130,23 @@ def _format_alert(event: dict) -> str:
     `operator_label` маппит internal-id (`central`/`evika`/`battery-fly`)
     в брендовое имя (`Маланка`/`Evika`/`Battery-fly`).
 
-    `free_connector_types` — список ярлыков коннекторов, которые освободились
-    в этом конкретном событии (например `["Chademo"]` или
-    `["Розетка Type2", "Пистолет Type2"]`). Пустой список = poller не смог
-    получить detail, типы неизвестны — строку «🔌» пропускаем.
+    Какие коннекторы показываем в строке «🔌»:
+      - предпочитаем `transitioned_connector_types` — что ИМЕННО только что
+        освободилось (Chademo, не «Type2 который уже час свободен»);
+      - fallback на `free_connector_types` — для legacy событий до того как
+        poller начал отдавать `transitioned_connector_types`;
+      - пустой список = poller не смог получить detail, типы неизвестны —
+        строку «🔌» пропускаем.
     """
     name = html.escape(str(event.get("name", "")))
     address = html.escape(str(event.get("address", "")))
     operator = html.escape(operator_label(event.get("operator")))
+    raw_transitioned = event.get("transitioned_connector_types") or []
     raw_free = event.get("free_connector_types") or []
+    shown = raw_transitioned if isinstance(raw_transitioned, list) and raw_transitioned else raw_free
     connector_line = ""
-    if isinstance(raw_free, list) and raw_free:
-        types = ", ".join(html.escape(str(t)) for t in raw_free if t)
+    if isinstance(shown, list) and shown:
+        types = ", ".join(html.escape(str(t)) for t in shown if t)
         if types:
             connector_line = f"🔌 {types}\n"
     return (
@@ -178,8 +188,25 @@ class Notifier:
         parse_mode: str | None = "HTML",
         silent: bool = False,
     ) -> bool:
-        async with self._limiter:
-            try:
+        """Send one message. Returns True iff Telegram accepted it.
+
+        Контракт ошибок (важно для классификации silent loss):
+
+        - ``TelegramForbiddenError`` — юзер заблокировал бота / удалил чат.
+          Дальше слать ему бесполезно; возвращаем False (caller освободит
+          claim). Подписки не удаляем — пусть отвалятся естественно по
+          quota или по /delete_me.
+        - ``TelegramBadRequest`` — мы сами зафакапили payload (битый HTML
+          в имени локации, длиннющий keyboard, etc). Логируем громко с
+          превью текста — без этого silent loss трудно диагностировать.
+        - ``TelegramRetryAfter`` — flood-wait. Спим ВНЕ self._limiter,
+          иначе один тяжёлый юзер тормозит всю очередь на retry_after сек.
+          После сна — ровно одна повторная попытка.
+        - ``TelegramNetworkError`` — VPN/gluetun моргнул. Одна повторка
+          через короткий sleep — обычно проходит на втором ударе.
+        """
+        try:
+            async with self._limiter:
                 await self.bot.send_message(
                     tg_id,
                     text,
@@ -187,25 +214,46 @@ class Notifier:
                     reply_markup=keyboard,
                     disable_notification=silent,
                 )
-                return True
-            except TelegramRetryAfter as e:
-                log.warning("tg_flood_wait", user=tg_id, retry_after=e.retry_after)
-                await asyncio.sleep(e.retry_after + 1)
-                try:
-                    await self.bot.send_message(
-                        tg_id,
-                        text,
-                        parse_mode=parse_mode,
-                        reply_markup=keyboard,
-                        disable_notification=silent,
-                    )
-                    return True
-                except Exception as e2:  # noqa: BLE001
-                    log.warning("tg_send_failed_after_retry", user=tg_id, err=str(e2))
-                    return False
-            except Exception as e:  # noqa: BLE001
-                log.warning("tg_send_failed", user=tg_id, err=str(e))
-                return False
+            return True
+        except TelegramForbiddenError as e:
+            log.info("tg_user_blocked", user=tg_id, err=str(e))
+            return False
+        except TelegramBadRequest as e:
+            log.warning(
+                "tg_bad_request",
+                user=tg_id,
+                err=str(e),
+                parse_mode=parse_mode,
+                preview=text[:200],
+            )
+            return False
+        except TelegramRetryAfter as e:
+            log.warning("tg_flood_wait", user=tg_id, retry_after=e.retry_after)
+            # КРИТИЧЕСКИ важно — sleep СНАРУЖИ limiter'а, иначе один
+            # flood-wait (30-300 сек) застопорит весь pipeline отправки.
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramNetworkError as e:
+            log.warning("tg_network_error", user=tg_id, err=str(e))
+            await asyncio.sleep(1.0)
+        except Exception as e:  # noqa: BLE001
+            # Ловим всё прочее (баги aiogram, кодеки) — но громко, не warn.
+            log.exception("tg_send_failed", user=tg_id, err=str(e))
+            return False
+
+        # Сюда попадаем только из RetryAfter / NetworkError — одна повторка.
+        try:
+            async with self._limiter:
+                await self.bot.send_message(
+                    tg_id,
+                    text,
+                    parse_mode=parse_mode,
+                    reply_markup=keyboard,
+                    disable_notification=silent,
+                )
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("tg_send_failed_after_retry", user=tg_id, err=str(e))
+            return False
 
     # -------- dedup/cooldown --------
 
@@ -408,13 +456,18 @@ class Notifier:
         text = _format_alert(event)
         location_name = str(event.get("name", "локация"))
 
-        # Какие именно типы коннекторов сейчас свободны на станции.
-        # Заполняется poller-ом на transition AVAILABLE; пустой список = poller
-        # не смог получить detail. В этом случае фильтр по connector_type
-        # отключаем (shoot-the-moon: лучше false-positive пуш чем silent loss).
-        raw_free = event.get("free_connector_types") or []
-        free_types_set: set[str] = (
-            set(raw_free) if isinstance(raw_free, list) else set()
+        # Какие именно типы коннекторов ОСВОБОДИЛИСЬ в этом событии.
+        # Poller отдаёт `transitioned_connector_types` — diff между двумя
+        # кадрами SSE (или агрегатный flip для REST). Это то, что реально
+        # переключилось в Available, а не «сейчас свободно вообще» — иначе
+        # подписчик на Chademo получал бы пуш, когда освободился Type2.
+        # Fallback на `free_connector_types` — для событий, опубликованных
+        # старым poller'ом до этого фикса (rolling deploy).
+        raw_transitioned = event.get("transitioned_connector_types")
+        if not isinstance(raw_transitioned, list) or not raw_transitioned:
+            raw_transitioned = event.get("free_connector_types") or []
+        transitioned_set: set[str] = (
+            set(raw_transitioned) if isinstance(raw_transitioned, list) else set()
         )
 
         # (tg_id, sub_id, silent) — silent=True значит «сейчас тихие часы»,
@@ -426,11 +479,13 @@ class Notifier:
         free_queue: list[tuple[int, int]] = []
         for sub, user in subs:
             # Фильтр по типу коннектора — только если sub его задал И poller
-            # знает что там сейчас свободно.
+            # знает, какие коннекторы реально только что освободились. Если
+            # transitioned_set пуст (legacy event без поля и без free types)
+            # — фильтр не применяем (лучше false-positive чем silent loss).
             if (
                 sub.connector_type is not None
-                and free_types_set
-                and sub.connector_type not in free_types_set
+                and transitioned_set
+                and sub.connector_type not in transitioned_set
             ):
                 continue
             # auto-downgrade expired paid tier
@@ -483,7 +538,14 @@ class Notifier:
                     continue
                 try:
                     payload = orjson.loads(raw)
-                except Exception:
+                except Exception as e:  # noqa: BLE001
+                    # ZREM уже снял запись — payload потерян. Без warning'а
+                    # это была бы немая потеря целой пачки free-уведомлений.
+                    log.warning(
+                        "delayed_unparseable",
+                        err=str(e),
+                        preview=str(raw)[:200],
+                    )
                     continue
 
                 loc_id = int(payload["location_id"])
@@ -626,8 +688,17 @@ class Notifier:
                 for msg_id, fields in entries:
                     try:
                         event = orjson.loads(fields["data"])
-                    except Exception:
+                    except Exception as e:  # noqa: BLE001
                         # Unparseable — ack to drop, otherwise we'd retry forever.
+                        # Громко логируем: silent ack без warning'а скрывал бы
+                        # факт потери целого события — а это ровно тот класс
+                        # багов, против которого мы строим всю reliability-обвязку.
+                        log.warning(
+                            "stream_unparseable",
+                            msg_id=msg_id,
+                            err=str(e),
+                            preview=str(fields.get("data", ""))[:200],
+                        )
                         await self.redis.xack(EVENTS_STREAM, NOTIFIER_GROUP, msg_id)
                         continue
                     try:
