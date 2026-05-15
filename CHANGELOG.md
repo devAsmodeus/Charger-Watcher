@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.4.0...v0.4.1) (2026-05-15)
+
+
+### Bug Fixes
+
+* **notifier:** tighten cooldown to 60s + log silent claim rejects ([3cf2cf7](https://github.com/devAsmodeus/Charger-Watcher/commit/3cf2cf7c81341498b2dfa79248bff50d901a6a9d))
+* tighten notify cooldown to 60s + log silent claim rejects ([bf7e2ff](https://github.com/devAsmodeus/Charger-Watcher/commit/bf7e2ff60e4b13bd5b95481ce2b7978aea910346))
+
 ## [0.4.0](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.3.0...v0.4.0) (2026-05-15)
 
 
