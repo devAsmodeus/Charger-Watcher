@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.0](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.3.0...v0.4.0) (2026-05-15)
+
+
+### Features
+
+* **bot:** show 'already free' on subscribe, russify /list statuses ([0d5a5f8](https://github.com/devAsmodeus/Charger-Watcher/commit/0d5a5f88bbb7b3c84f368e6e19ca62f4964a5626))
+* **logging:** persistent errors.jsonl + docker log rotation ([bff0f89](https://github.com/devAsmodeus/Charger-Watcher/commit/bff0f89c96582f09ca146594375cd9bd4503b3af))
+
+
+### Bug Fixes
+
+* notification correctness + persistent logs ([2bfd826](https://github.com/devAsmodeus/Charger-Watcher/commit/2bfd826bc117f23c984e2f0d5feb990313855e9b))
+* **notifier:** explicit Telegram errors, filter by transitioned, warn on drops ([1e1de5f](https://github.com/devAsmodeus/Charger-Watcher/commit/1e1de5f7bdd3fc8be7245f8df26b12b5dd5470b8))
+* **poller:** per-connector SSE transitions, preserve REST baseline on 5xx ([273dc70](https://github.com/devAsmodeus/Charger-Watcher/commit/273dc70c0bedaa17eeb28ef96d2f4b8ec0c023a0))
+
+
+### Documentation
+
+* drop stale-claim reaper from tech-debt (shipped in 0.2.0) ([0fc3cb2](https://github.com/devAsmodeus/Charger-Watcher/commit/0fc3cb29638aa2b9aed6af535dd26ccfb8c4c857))
+* drop two stale CLAUDE.md tech-debt notes ([b95254a](https://github.com/devAsmodeus/Charger-Watcher/commit/b95254a22d083d7d5d0bb955fcb27be641af498b))
+* drop two stale tech-debt notes from CLAUDE.md ([e101232](https://github.com/devAsmodeus/Charger-Watcher/commit/e10123228689514e17b9dd026baa9c2bb3aff0d0))
+
 ## [0.3.0](https://github.com/devAsmodeus/Charger-Watcher/compare/v0.2.2...v0.3.0) (2026-05-14)
 
 
