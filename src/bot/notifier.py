@@ -244,6 +244,16 @@ class Notifier:
                 )
             ).first()
             if recent is not None:
+                # Silent skip раньше делал тихую потерю наблюдаемой как «бот
+                # не присылает» — лог даёт точку входа для аудита: видим, что
+                # claim был отклонён cooldown'ом, а не упал send.
+                log.info(
+                    "cooldown_skip",
+                    sub=sub_id,
+                    loc=loc_id,
+                    event_epoch=event_epoch,
+                    cooldown_sec=self.settings.notify_cooldown_sec,
+                )
                 return False  # cooldown still active
 
             ins = (

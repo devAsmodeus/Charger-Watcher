@@ -37,7 +37,12 @@ class Settings(BaseSettings):
     free_tier_notify_delay_sec: int = Field(default=120, alias="FREE_TIER_NOTIFY_DELAY_SEC")
     free_tier_max_subscriptions: int = Field(default=1, alias="FREE_TIER_MAX_SUBSCRIPTIONS")
     paid_tier_max_subscriptions: int = Field(default=5, alias="PAID_TIER_MAX_SUBSCRIPTIONS")
-    notify_cooldown_sec: int = Field(default=600, alias="NOTIFY_COOLDOWN_SEC")
+    # Cooldown между двумя успешными push'ами по одной (sub, loc) — защита
+    # от flicker'а станции (Available→Busy→Available за несколько секунд).
+    # Раньше было 600s = 10 мин — съедало легитимные транзишены вида
+    # «занято 4 минуты, отъехал, снова свободно» как silent loss. 60s
+    # достаточно против flicker'а и не мешает реальным циклам.
+    notify_cooldown_sec: int = Field(default=60, alias="NOTIFY_COOLDOWN_SEC")
     tier_reaper_interval_sec: int = Field(default=3600, alias="TIER_REAPER_INTERVAL_SEC")
     tg_send_rate_per_sec: int = Field(default=20, alias="TG_SEND_RATE_PER_SEC")
 
